@@ -3711,6 +3711,8 @@ local TECH_BLACKLIST = {
 local TECH_BLACKLIST_KEYWORDS = {
 	"Intelligence",
 	"Industry",
+	"Fortifications",
+	"Anti Air",
 }
 
 local function isBlacklisted(techName)
