@@ -12840,7 +12840,7 @@ function Profiler.run(label, callee, ...)
 		})
 	end
 	if not results[1] then
-		return error(results[PCALL_RESULTS_START_INDEX], 0)
+		return error(string.format("[%s] %s", tostring(label), tostring(results[PCALL_RESULTS_START_INDEX])), 0)
 	end
 	return table.unpack(results, PCALL_RESULTS_START_INDEX, results.n)
 end
@@ -13537,7 +13537,17 @@ Tracer.currentTraceId = "none"
 Tracer.frames = {}
 
 function Tracer.context() return "none", 0 end
-function Tracer.withTrace(_, callee, ...) return callee(...) end
+function Tracer.withTrace(_, callee, ...)
+	local results = table.pack(xpcall(function(...)
+		return callee(...)
+	end, function(err)
+		return debug.traceback(tostring(err), 2)
+	end, ...))
+	if not results[1] then
+		error(results[2], 0)
+	end
+	return table.unpack(results, 2, results.n)
+end
 function Tracer.step() end
 function Tracer.describeValue(v) return v end
 function Tracer.describeValues() return {} end
