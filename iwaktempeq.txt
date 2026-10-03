@@ -370,6 +370,27 @@ Formula.define({
 	},
 })
 
+-- [AIR-r5] Formula biaya upgrade airfield.
+local AIRFIELD_BASE_UPGRADE_COST = 15000
+local AIRFIELD_PER_LEVEL_COST = 1000
+local AIR_RESERVE_MONEY = 15000
+
+Formula.define({
+	id = "air.upgradeCost",
+	tier = "T3",
+	source = "ui_source L15882: airfieldBaseUpgradeCost + airfieldUpgradeCostPerLvl * level",
+	expression = "baseCost + perLevel * currentLevel",
+	unit = "money",
+	inputs = { baseCost = "airfieldBaseUpgradeCost (15000 default)", perLevel = "airfieldUpgradeCostPerLvl (1000 default)", level = "current airfield level" },
+	compute = function(inputs)
+		return (inputs.baseCost or AIRFIELD_BASE_UPGRADE_COST) + (inputs.perLevel or AIRFIELD_PER_LEVEL_COST) * inputs.level
+	end,
+	examples = {
+		{ inputs = { baseCost = 15000, perLevel = 1000, level = 1 }, expected = 16000, tolerance = 0 },
+		{ inputs = { baseCost = 15000, perLevel = 1000, level = 5 }, expected = 20000, tolerance = 0 },
+	},
+})
+
 ---Our airfields with their decoded plane counts.
 ---@param country Instance
 ---@return table array
@@ -567,6 +588,425 @@ function AirPlanner.run(world, plan)
 	end
 
 	Logger.debug("Features.Air.AirPlanner", "run", { airfields = #airfields, targetRegions = regionNames, deployed = deployed })
+end
+
+-- =====================================================================
+-- [AIR-r5] Fitur baru: Upgrade, Reposition, Build, Priority, Nuke
+-- =====================================================================
+
+AirPlanner.lastUpgradeTick = -100
+AirPlanner.lastRepositionTick = -100
+AirPlanner.lastBuildTick = -100
+AirPlanner.lastPriorityTick = -100
+AirPlanner.nukeUsedThisSession = false
+AirPlanner.airfieldPriorityState = {}
+
+---Hitung jarak terpendek dari sebuah tile ke front aktif (tile contact musuh).
+---Menggunakan ThreatHeat sebagai proxy cepat: heat > 0 berarti dekat musuh.
+---@param world table
+---@param tileName string
+---@return number distance skor kedekatan (lebih kecil = lebih dekat ke front)
+local function frontProximity(world, tileName)
+	local heat = ThreatHeat.at(tileName)
+	if heat > 0 then
+		return 1 / heat
+	end
+	local record = MapGraph.tiles[tileName]
+	if record == nil then return math.huge end
+	local bestDist = math.huge
+	for _, enemy in ipairs(world.enemyUnits or {}) do
+		local eRecord = MapGraph.tiles[enemy.tile]
+		if eRecord ~= nil then
+			local d = (record.position - eRecord.position).Magnitude
+			if d < bestDist then bestDist = d end
+		end
+	end
+	return bestDist
+end
+
+-- =====================================================================
+-- 1. AUTO-UPGRADE AIRFIELD
+-- =====================================================================
+
+---Upgrade satu airfield yang paling dekat dengan front dan masih rendah levelnya.
+---@param world table
+---@param plan table
+function AirPlanner.runUpgrades(world, plan)
+	if not Settings.get("air.upgrade") then return nil end
+	if not Settings.get("air.enabled") then return nil end
+	local tickId = world.tickNumber or 0
+	if AirPlanner.lastUpgradeTick == tickId then return nil end
+	AirPlanner.lastUpgradeTick = tickId
+
+	local airMap = workspace:FindFirstChild("AirMap")
+	if airMap == nil then return nil end
+
+	local airforce = Resolver.requireChild(world.meInstance, "Airforce")
+	local airfields = ourAirfields(world.meInstance)
+	if #airfields == 0 then return nil end
+
+	local treasury = world.meInstance:GetAttribute("money") or 0
+	if treasury < AIR_RESERVE_MONEY then return nil end
+
+	local maxLevel = Resolver.optionalAttribute(airforce, "airfieldMaxLvl", "number", "default 10") or 10
+
+	local scored = {}
+	for _, af in ipairs(airfields) do
+		if af.level < maxLevel then
+			local prox = frontProximity(world, af.tileName)
+			table.insert(scored, {
+				airfield = af,
+				score = (af.level * 1000) + prox,
+				proximity = prox,
+			})
+		end
+	end
+
+	table.sort(scored, function(a, b)
+		if a.proximity ~= b.proximity then return a.proximity < b.proximity end
+		return a.airfield.level < b.airfield.level
+	end)
+
+	local best = scored[1]
+	if best == nil then return nil end
+
+	local cost = Formula.evaluate("air.upgradeCost", {
+		baseCost = AIRFIELD_BASE_UPGRADE_COST,
+		perLevel = AIRFIELD_PER_LEVEL_COST,
+		level = best.airfield.level,
+	})
+
+	if treasury < cost + AIR_RESERVE_MONEY then
+		return { skipped = true, reason = "insufficient funds", cost = cost, money = treasury }
+	end
+
+	ActionDispatcher.dispatch({
+		remote = "TryUpgradeAirfield",
+		args = { best.airfield.city },
+		key = "airUpgrade:" .. best.airfield.city.Name .. ":" .. tostring(best.airfield.level),
+		reason = string.format("upgrade airfield %s L%d->L%d (%.0f money, proximity %.0f)",
+			best.airfield.city.Name, best.airfield.level, best.airfield.level + 1, cost, best.proximity),
+		tier = TIER,
+	})
+
+	Logger.info("Features.Air.AirPlanner", "upgradeSent", {
+		city = best.airfield.city.Name, fromLevel = best.airfield.level, cost = cost,
+	})
+	return { upgraded = best.airfield.city.Name, fromLevel = best.airfield.level, cost = cost }
+end
+
+-- =====================================================================
+-- 2. REPOSITION PLANES
+-- =====================================================================
+
+---Pindahkan pesawat dari airfield jauh ke airfield dekat front yang butuh CAS.
+---@param world table
+---@param plan table
+function AirPlanner.runReposition(world, plan)
+	if not Settings.get("air.reposition") then return nil end
+	if not Settings.get("air.enabled") then return nil end
+	local tickId = world.tickNumber or 0
+	if AirPlanner.lastRepositionTick == tickId then return nil end
+	AirPlanner.lastRepositionTick = tickId
+
+	local airMap = workspace:FindFirstChild("AirMap")
+	if airMap == nil then return nil end
+
+	local airforce = Resolver.requireChild(world.meInstance, "Airforce")
+	local airfields = ourAirfields(world.meInstance)
+	if #airfields < 2 then return nil end
+
+	local neededRegions = {}
+	for _, order in ipairs(plan.orders or {}) do
+		if ATTACK_PURPOSES[order.purpose] then
+			local regionName = MapGraph.tiles[order.destination] and MapGraph.tiles[order.destination].airRegion
+			if regionName ~= nil then
+				local regionPart = airMap:FindFirstChild(regionName)
+				if regionPart ~= nil and regionPart:FindFirstChild(world.me) == nil then
+					local stackSize = (order.facts and order.facts.stackSize) or 1
+					local ratio = (order.facts and order.facts.ratio) or 0
+					local need = stackSize * (1 - math.min(ratio, 1))
+					local prev = neededRegions[regionName] or 0
+					if need > prev then neededRegions[regionName] = need end
+				end
+			end
+		end
+	end
+
+	if next(neededRegions) == nil then return nil end
+
+	local moved = 0
+	for regionName, need in pairs(neededRegions) do
+		if moved >= 1 then break end
+		local regionPart = airMap:FindFirstChild(regionName)
+		if regionPart ~= nil then
+
+		local destAirfield = nil
+		local bestDist = math.huge
+		for _, af in ipairs(airfields) do
+			local planeData, range, distance = deployFor(airforce, af, regionPart, CAS_TYPES)
+			if planeData ~= nil and distance < bestDist then
+				bestDist = distance
+				destAirfield = af
+			end
+		end
+
+		if destAirfield ~= nil then
+
+		local srcAirfield = nil
+		local mostPlanes = 0
+		for _, af in ipairs(airfields) do
+			if af.city.Name ~= destAirfield.city.Name then
+				local totalCas = 0
+				for _, ct in ipairs(CAS_TYPES) do
+					totalCas += (af.planes[ct] or 0)
+				end
+				local totalFighter = 0
+				for _, ft in ipairs(FIGHTER_TYPES) do
+					totalFighter += (af.planes[ft] or 0)
+				end
+				local total = totalCas + totalFighter
+				if total > mostPlanes then
+					local _, reachRange, reachDist = deployFor(airforce, af, regionPart, CAS_TYPES)
+					if reachRange == nil then
+						mostPlanes = total
+						srcAirfield = af
+					end
+				end
+			end
+		end
+
+		if srcAirfield ~= nil then
+			local moveData = {}
+			for _, typeName in ipairs(PLANE_TYPES) do
+				moveData[typeName] = 0
+			end
+			for _, ct in ipairs(CAS_TYPES) do
+				moveData[ct] = math.floor(srcAirfield.planes[ct] or 0)
+			end
+			for _, ft in ipairs(FIGHTER_TYPES) do
+				moveData[ft] = math.floor(srcAirfield.planes[ft] or 0)
+			end
+
+			local totalMove = 0
+			for _, v in pairs(moveData) do totalMove += v end
+			if totalMove > 0 then
+				ActionDispatcher.dispatch({
+					remote = "TryMovePlanes",
+					args = { srcAirfield.city, destAirfield.city, moveData },
+					key = "airMove:" .. srcAirfield.city.Name .. "->" .. destAirfield.city.Name,
+					reason = string.format("reposition %d planes from %s to %s for region %s",
+						totalMove, srcAirfield.city.Name, destAirfield.city.Name, regionName),
+					tier = TIER,
+				})
+				moved += 1
+			end
+		end
+		end
+		end
+	end
+
+	if moved > 0 then
+		Logger.info("Features.Air.AirPlanner", "repositionSent", { count = moved })
+	end
+	return { moved = moved }
+end
+
+-- =====================================================================
+-- 3. BUILD NEW AIRFIELD (placeholder - needs remote arg confirmation)
+-- =====================================================================
+
+---Scan kota tanpa airfield dan rekomendasikan pembangunan.
+---TODO-AIR-BUILD: TryBuildAiport args belum terkonfirmasi via traffic log.
+---Saat ini hanya logging rekomendasi, tidak dispatch remote.
+---@param world table
+function AirPlanner.runBuild(world)
+	if not Settings.get("air.build") then return nil end
+	if not Settings.get("air.enabled") then return nil end
+	local tickId = world.tickNumber or 0
+	if AirPlanner.lastBuildTick == tickId then return nil end
+	AirPlanner.lastBuildTick = tickId
+
+	local cities = Resolver.requireChild(world.meInstance, "Cities"):GetChildren()
+	local candidates = {}
+
+	for _, city in ipairs(cities) do
+		local airfield = city:FindFirstChild("Airfield")
+		if airfield == nil then
+			local tileName = Resolver.optionalAttribute(city, "tileName", "string", "city without tileName")
+			if tileName ~= nil and world.tileOwner[tileName] == world.me then
+				local prox = frontProximity(world, tileName)
+				local isPort = city:GetAttribute("isPort") == true
+				local score = prox - (isPort and 500 or 0)
+				table.insert(candidates, {
+					city = city, tileName = tileName,
+					proximity = prox, isPort = isPort, score = score,
+				})
+			end
+		end
+	end
+
+	if #candidates == 0 then return nil end
+
+	table.sort(candidates, function(a, b) return a.score < b.score end)
+
+	local best = candidates[1]
+	Logger.info("Features.Air.AirPlanner", "buildRecommendation", {
+		city = best.city.Name, tile = best.tileName,
+		proximity = best.proximity, isPort = best.isPort,
+		note = "TryBuildAiport args unconfirmed; dispatch skipped. Run traffic log to confirm.",
+	})
+
+	return { recommended = best.city.Name, dispatched = false, reason = "args unconfirmed" }
+end
+
+-- =====================================================================
+-- 4. AIRFIELD PRIORITY TOGGLE
+-- =====================================================================
+
+---Set priority ON untuk airfield dekat front, OFF untuk yang jauh.
+---@param world table
+---@param plan table
+function AirPlanner.runPriority(world, plan)
+	if not Settings.get("air.enabled") then return nil end
+	local tickId = world.tickNumber or 0
+	if AirPlanner.lastPriorityTick == tickId then return nil end
+	AirPlanner.lastPriorityTick = tickId
+
+	local airfields = ourAirfields(world.meInstance)
+	local toggled = 0
+	local PRIORITY_FRONT_THRESHOLD = 800
+	local MAX_TOGGLES_PER_TICK = 2
+
+	for _, af in ipairs(airfields) do
+		if toggled >= MAX_TOGGLES_PER_TICK then break end
+		local airfield = af.city:FindFirstChild("Airfield")
+		if airfield ~= nil then
+			local prox = frontProximity(world, af.tileName)
+			local shouldBeOn = prox < PRIORITY_FRONT_THRESHOLD
+			local currentState = AirPlanner.airfieldPriorityState[af.city.Name]
+
+			if currentState ~= shouldBeOn then
+				ActionDispatcher.dispatch({
+					remote = "SetAirfieldPriority",
+					args = { airfield, shouldBeOn },
+					key = "airPriority:" .. af.city.Name .. ":" .. tostring(shouldBeOn),
+					reason = string.format("set airfield priority %s for %s (proximity %.0f)",
+						shouldBeOn and "ON" or "OFF", af.city.Name, prox),
+					tier = TIER,
+				})
+				AirPlanner.airfieldPriorityState[af.city.Name] = shouldBeOn
+				toggled += 1
+			end
+		end
+	end
+
+	if toggled > 0 then
+		Logger.debug("Features.Air.AirPlanner", "priorityToggled", { count = toggled })
+	end
+	return { toggled = toggled }
+end
+
+-- =====================================================================
+-- 5. NUKE DEPLOYMENT VIA AIR
+-- =====================================================================
+
+---Deploy nuklir via bomber jika tersedia dan setting aktif.
+---@param world table
+---@param plan table
+function AirPlanner.runNuke(world, plan)
+	if not Settings.get("air.nuke") then return nil end
+	if not Settings.get("air.enabled") then return nil end
+	if AirPlanner.nukeUsedThisSession then return nil end
+
+	local prodItems = world.meInstance:FindFirstChild("ProductionItems")
+	if prodItems == nil then return nil end
+	local nukeItem = prodItems:FindFirstChild("Nuke")
+	if nukeItem == nil then return nil end
+	local nukeStock = nukeItem:GetAttribute("stock") or 0
+	if nukeStock <= 0 then return nil end
+
+	local airMap = workspace:FindFirstChild("AirMap")
+	if airMap == nil then return nil end
+
+	local airfields = ourAirfields(world.meInstance)
+	local bomberTypes = { "Bomber I", "Bomber II" }
+
+	local bestTarget = nil
+	local bestScore = 0
+
+	for enemyName in pairs(world.enemies) do
+		local capTile = world.enemyCapitals[enemyName]
+		if capTile ~= nil then
+			local occupant = world.unitsByTile[capTile]
+			if occupant ~= nil and world.enemies[occupant.owner] then
+				local score = (occupant.health or 100) * (occupant.defense or 1)
+				if score > bestScore then
+					bestScore = score
+					bestTarget = { tile = capTile, enemy = enemyName, type = "capital" }
+				end
+			end
+		end
+	end
+
+	if bestTarget == nil then
+		local largestStack = nil
+		local largestCount = 0
+		for _, enemy in ipairs(world.enemyUnits or {}) do
+			local bucket = world.unitsOnTile[enemy.tile] or {}
+			if #bucket > largestCount then
+				largestCount = #bucket
+				largestStack = enemy
+			end
+		end
+		if largestStack ~= nil and largestCount >= 2 then
+			bestTarget = { tile = largestStack.tile, enemy = largestStack.owner, type = "stack" }
+		end
+	end
+
+	if bestTarget == nil then return nil end
+
+	local regionName = MapGraph.tiles[bestTarget.tile] and MapGraph.tiles[bestTarget.tile].airRegion
+	if regionName == nil then return nil end
+	local regionPart = airMap:FindFirstChild(regionName)
+	if regionPart == nil then return nil end
+
+	local airforce = Resolver.requireChild(world.meInstance, "Airforce")
+
+	for _, af in ipairs(airfields) do
+		local hasBomber = false
+		for _, bt in ipairs(bomberTypes) do
+			if (af.planes[bt] or 0) >= 1 then hasBomber = true; break end
+		end
+		if hasBomber then
+			local planeData = {}
+			for _, typeName in ipairs(PLANE_TYPES) do planeData[typeName] = 0 end
+			for _, bt in ipairs(bomberTypes) do
+				planeData[bt] = math.floor(af.planes[bt] or 0)
+			end
+
+			local total = 0
+			for _, v in pairs(planeData) do total += v end
+			if total > 0 then
+				ActionDispatcher.dispatch({
+					remote = "TryDeployPlanes",
+					args = { af.city, regionPart, planeData, "nuke" },
+					key = "nukeDeploy:" .. bestTarget.tile .. ":" .. af.city.Name,
+					reason = string.format("NUCLEAR STRIKE on %s %s via %s (%d bombers)",
+						bestTarget.type, bestTarget.tile, af.city.Name, total),
+					tier = TIER,
+				})
+				AirPlanner.nukeUsedThisSession = true
+				Logger.warn("Features.Air.AirPlanner", "nukeDeployed", {
+					target = bestTarget.tile, enemy = bestTarget.enemy,
+					type = bestTarget.type, airfield = af.city.Name,
+				})
+				return { deployed = true, target = bestTarget.tile, type = bestTarget.type }
+			end
+		end
+	end
+
+	return { deployed = false, reason = "no bomber in range of target" }
 end
 
 return Tracer.instrument("Features.Air.AirPlanner", AirPlanner)
@@ -2632,6 +3072,10 @@ local SWITCHES = {
 
 	-- Air
 	{ key = "air.enabled",             tab = "AI", section = "Air",          label = "Air",                         default = true, defaultSource = "auto-enabled", effect = "Deploys CAS." },
+	{ key = "air.upgrade",             tab = "AI", section = "Air",          label = "Upgrade airfields",           default = false, defaultSource = "opt-in: spends money per upgrade", effect = "Upgrades airfields near the front to extend CAS range." },
+	{ key = "air.reposition",          tab = "AI", section = "Air",          label = "Reposition planes",           default = false, defaultSource = "opt-in: moves planes between airfields", effect = "Moves idle planes to airfields closer to active fronts." },
+	{ key = "air.build",               tab = "AI", section = "Air",          label = "Build new airfields",         default = false, defaultSource = "opt-in: builds airfields at strategic cities", effect = "Builds airfields at cities without one that are near the front." },
+	{ key = "air.nuke",                tab = "AI", section = "Air",          label = "Nuclear deployment",          default = false, defaultSource = "opt-in: deploys nukes via bombers", effect = "Deploys nuclear weapons via bomber aircraft against high-value targets." },
 
 	-- Client
 	{ key = "antiIdle.enabled",        tab = "AI", section = "Client",       label = "Prevent idle kick",           default = true, defaultSource = "auto-enabled", effect = "Answers idle notice." },
@@ -2662,7 +3106,7 @@ function SettingsCatalog.defineAll()
 	end
 	-- [FIX-BUILD] Sidik jari build: verifikasi versi yang benar-benar berjalan dengan SATU baris.
 	--   print(shared.CTW_Build, #shared.CTW_SettingsKeys)   -> r4 = 19, build lama = nil
-	shared.CTW_Build = "r4-forts+generals"
+	shared.CTW_Build = "r6-researchq+"
 	shared.CTW_SettingsKeys = {}
 	for _, definition in ipairs(Settings.definitions) do
 		table.insert(shared.CTW_SettingsKeys, definition.key)
@@ -3101,6 +3545,41 @@ local function planProduction(world, country, analysis)
 						item = item.name, factories = want, stock = stock,
 						reason = "essential item under stock threshold",
 					})
+				end
+			end
+		end
+	end
+
+	-- [AIR-r5] Smart plane production: alokasikan factory tambahan untuk pesawat
+	-- berdasarkan kebutuhan front aktual, bukan hanya keyword match minimum.
+	if atWar and assigned < totalFactories then
+		local planeKeywords = { "cas", "fighter", "bomber" }
+		local planeItems = {}
+		for _, item in ipairs(items) do
+			local lower = string.lower(item.name)
+			for _, kw in ipairs(planeKeywords) do
+				if string.find(lower, kw, 1, true) then
+					table.insert(planeItems, item)
+					break
+				end
+			end
+		end
+		if #planeItems > 0 then
+			local spareFactories = totalFactories - assigned
+			local planeBudget = math.min(spareFactories, math.max(2, math.floor(totalFactories * 0.15)))
+			local perItem = math.max(1, math.floor(planeBudget / #planeItems))
+			for _, pItem in ipairs(planeItems) do
+				local currentDesired = desired[pItem.name] or 0
+				local stock = pItem.stock or 0
+				if stock < 5 and currentDesired < perItem then
+					local extra = math.min(perItem - currentDesired, totalFactories - assigned)
+					if extra > 0 then
+						desired[pItem.name] = currentDesired + extra
+						assigned += extra
+						Logger.info("Features.Economy.EconomyPlanner", "smartPlaneAlloc", {
+							item = pItem.name, added = extra, stock = stock,
+						})
+					end
 				end
 			end
 		end
@@ -3693,16 +4172,63 @@ local ActionDispatcher = require("Features/Orders/ActionDispatcher")
 local COMPLETE = 1
 local TIER = "R"
 
-local TECH_PRIORITY = {
-	["Infantry Equipment II"] = true,
-	["Infantry Equipment III"] = true,
-	["Housing I"] = true,
-	["Housing II"] = true,
-	["Housing III"] = true,
+-- [RESEARCH-FIXED] Prioritas riset hardcoded — user tinggal terima jadi.
+-- Urutan array = prioritas (index 1 = paling tinggi).
+-- Nama tech yang tidak ada di tech tree cukup diabaikan (tidak match = boost 0).
+local BUILTIN_RESEARCH_PRIORITY = {
+	"Infantry Equipment II",
+	"Infantry Equipment III",
+	"Housing I",
+	"Infantry Equipment IV",
+	"Mechanization I",
+	"Mechanization II",
+	"Anti Tank I",
+	"Anti Tank II",
+	"Anti Tank III",
+	"Tank Parts I",
+	"Tank Parts II",
+	"Tank Parts III",
+	"Tank Parts IV",
+	"Housing II",
+	"Housing III",
+	"Mechanization III",
+	"CAS I",
+	"Fighter I",
+	"CAS II",
+	"Fighter II",
+	"Infantry Armor II",
+	"Infantry Armor III",
+	"Infantry Armor IV",
+	"Infantry Attack Equipment I",
+	"Infantry Attack Equipment II",
+	"Support Equipment I",
+	"Support Equipment II",
+	"Support Equipment III",
+	"Tank Turret I",
+	"Tank Turret II",
+	"Tank Turret III",
+	"Tank Turret IV",
+	"Bomber I",
+	"Bomber II",
+	"Industry I",
+	"Industry II",
+	"Uranium Mining",
+	"Uranium Enrichment",
+	"Nuke",
 }
 
+-- Basis boost. Tech di posisi 1 = -1000, posisi 2 = -999, dst.
+-- Nilai negatif ini jauh lebih besar dari score tier (1..5), jadi tech di
+-- daftar SELALU dipilih lebih dulu dibanding tech di luar daftar.
+local PRIORITY_BOOST_BASE = 1000
+
 local function priorityBoost(techName)
-	return TECH_PRIORITY[techName] and -1 or 0
+	for index, name in ipairs(BUILTIN_RESEARCH_PRIORITY) do
+		if name == techName then
+			return -(PRIORITY_BOOST_BASE - index)
+		end
+	end
+	return 0
 end
 
 local TECH_BLACKLIST = {
@@ -3710,9 +4236,6 @@ local TECH_BLACKLIST = {
 
 local TECH_BLACKLIST_KEYWORDS = {
 	"Intelligence",
-	"Industry",
-	"Fortifications",
-	"Anti Air",
 }
 
 local function isBlacklisted(techName)
@@ -4684,8 +5207,11 @@ function BorderPrep.holdActive(world, plan)
 	end
 end
 
-function BorderPrep.gatherIdle(world, plan)
-	if not BorderPrep.gatherEnabled then return end
+---Mode lama: tarik SEMUA idle unit ke ring capital (radius 3).
+---Dipanggil oleh wrapper `BorderPrep.gatherIdle` hanya saat toggle ON.
+---@param world table
+---@param plan table
+local function gatherToCapital(world, plan)
 	if next(world.enemies) ~= nil then return end
 	if world.capitalTile == nil or world.tileOwner[world.capitalTile] ~= world.me then return end
 
@@ -4751,6 +5277,129 @@ function BorderPrep.gatherIdle(world, plan)
 	end
 	if moved > 0 then
 		Logger.info("Features.Military.BorderPrep", "gatherIdle", { moved = moved })
+	end
+end
+
+---[SPREAD-FIX] Mode BARU saat toggle `gatherEnabled` OFF:
+---Sebar unit Idle ke border tile, TANPA mengganggu:
+---  * 1 unit penjaga capital  (sudah di-hold oleh DefensePlanner.capital, tier T0)
+---  * 3 unit penjaga ring     (sudah di-hold oleh DefensePlanner.ensureCapitalRing, tier T0)
+---Karena unit di capital/ring sudah di-assign oleh tier T0, mereka otomatis
+---tidak akan diambil oleh fungsi ini (plan:isAvailable mengembalikan false).
+---@param world table
+---@param plan table
+---@return table { moved, freeBorderTiles?, reason? }
+local function spreadIdleToBorder(world, plan)
+	-- 1. Kumpulkan SEMUA border tile kita (vs semua negara tetangga darat).
+	local borderMap = Ownership.borderNeighbours(world)
+	local borderTiles = {}
+	for _, tiles in pairs(borderMap) do
+		for tile in pairs(tiles) do
+			if world.tileOwner[tile] == world.me then
+				borderTiles[tile] = true
+			end
+		end
+	end
+	if next(borderTiles) == nil then
+		return { moved = 0, reason = "no border tiles" }
+	end
+
+	-- 2. Kumpulkan border tile yang masih KOSONG dan bisa ditempati.
+	local freeBorder = {}
+	local freeCount = 0
+	for tile in pairs(borderTiles) do
+		if world.unitsByTile[tile] == nil and plan:isFreeDestination(tile) then
+			freeBorder[tile] = true
+			freeCount += 1
+		end
+	end
+	if freeCount == 0 then
+		return { moved = 0, reason = "every border tile already occupied" }
+	end
+
+	-- 3. Kandidat: unit Idle kita yang:
+	--    - bukan di border tile (sudah jaga di sana)
+	--    - bukan di capital/ring (sudah di-hold tier T0)
+	--    - lulus gate health/supply/flagged seperti gatherToCapital
+	local candidates = {}
+	for _, unit in ipairs(world.ourUnits) do
+		if unit.owner == world.me
+			and not unit.flagged
+			and unit.state == "Idle"
+			and (unit.health or 0) >= MIN_UNIT_HEALTH
+			and SupplyModel.isSupplied(world, unit.tile)
+			and not borderTiles[unit.tile]
+			and plan:isAvailable(unit)
+		then
+			table.insert(candidates, unit)
+		end
+	end
+	if #candidates == 0 then
+		return { moved = 0, reason = "no eligible idle units to spread" }
+	end
+
+	-- 4. Prioritas: unit paling JAUH dari capital dulu
+	--    (biar capital cepat lega, unit dekat capital tetap di dekat capital).
+	local capitalPos = MapGraph.tiles[world.capitalTile].position
+	table.sort(candidates, function(a, b)
+		local aPos = MapGraph.tiles[a.tile].position
+		local bPos = MapGraph.tiles[b.tile].position
+		local aDist = (aPos - capitalPos).Magnitude
+		local bDist = (bPos - capitalPos).Magnitude
+		if aDist ~= bDist then return aDist > bDist end
+		return a.id < b.id
+	end)
+
+	-- 5. Assign satu unit per border tile, sampai kandidat habis.
+	local moved = 0
+	local used = {}
+	for _, unit in ipairs(candidates) do
+		if moved >= freeCount then break end
+		if plan:isAvailable(unit) then
+			-- [FIX-B1] satu BFS per unit lewat predikat accept,
+			-- bukan satu BFS per border tile (mahal).
+			local bestPath = Tactics.nearestTile(world, plan, unit,
+				function(t) return freeBorder[t] == true and used[t] ~= true end,
+				false)
+			if bestPath ~= nil then
+				local dest = bestPath[#bestPath]
+				plan:assign(unit, bestPath, "spreadIdle", TIER_GATHER,
+					"spread idle unit to border (capital guard already assigned by T0)",
+					{ destination = dest })
+				used[dest] = true
+				moved += 1
+			end
+		end
+	end
+
+	if moved > 0 then
+		Logger.info("Features.Military.BorderPrep", "spreadIdleToBorder", {
+			moved = moved, freeBorderTiles = freeCount,
+			borderNeighbours = (function()
+				local names = {}
+				for name in pairs(borderMap) do table.insert(names, name) end
+				table.sort(names)
+				return names
+			end)(),
+		})
+	end
+
+	return { moved = moved, freeBorderTiles = freeCount }
+end
+
+---[SPREAD-FIX] Wrapper publik: dipilih otomatis berdasarkan toggle GUI.
+---  * gatherEnabled == true  -> mode lama: tarik semua idle ke ring capital radius 3
+---  * gatherEnabled == false -> mode baru: sebar idle ke border, sisakan 3 di ring
+---@param world table
+---@param plan table
+function BorderPrep.gatherIdle(world, plan)
+	if next(world.enemies) ~= nil then return end
+	if world.capitalTile == nil or world.tileOwner[world.capitalTile] ~= world.me then return end
+
+	if BorderPrep.gatherEnabled then
+		gatherToCapital(world, plan)
+	else
+		spreadIdleToBorder(world, plan)
 	end
 end
 
@@ -6069,10 +6718,18 @@ local function findRestAttackTarget(world, unit)
 	return bestTile, bestRatio
 end
 
-local CAPITAL_RING_SIZE = 0
-local CAPITAL_RING_MIN_TOTAL_UNITS = 2
+-- [SPREAD-FIX] User request: 3 unit penjaga di ring capital (langsung tetangga capital).
+-- Capital sendiri tetap 1 unit (di-hold oleh DefensePlanner.capital).
+-- Sisanya bebas untuk spread ke border (lihat BorderPrep.gatherIdle mode OFF).
+local CAPITAL_RING_SIZE = 3
+local CAPITAL_RING_MIN_TOTAL_UNITS = 4
 
-local function ensureCapitalRing(world, plan, capitalTile)
+---@param world table
+---@param plan table
+---@param capitalTile string
+---@param zoneThreatened boolean  true = capital/neighbour sedang diserang
+---@return number placed
+local function ensureCapitalRing(world, plan, capitalTile, zoneThreatened)
 	local record = MapGraph.tiles[capitalTile]
 	if record == nil then return 0 end
 
@@ -6103,9 +6760,12 @@ local function ensureCapitalRing(world, plan, capitalTile)
 		local occ = world.unitsByTile[tile]
 
 		if occ ~= nil and occ.owner == world.me and not occ.flagged then
-			if plan:isAvailable(occ) then
+			-- [FIX-RING-ATTACK] Hold HANYA saat capital tidak terancam.
+			-- Saat musuh menyerang, biarkan unit ini bebas supaya tier T1
+			-- (relief) dan A0 (capitalStrike) bisa memakainya untuk melawan.
+			if not zoneThreatened and plan:isAvailable(occ) then
 				plan:hold(occ, "capitalRingHold", TIER_CAPITAL,
-					"already guarding a capital ring tile")
+					"already guarding a capital ring tile (peaceful)")
 			end
 			placed += 1
 		elseif occ == nil and plan:isFreeDestination(tile) then
@@ -6264,7 +6924,7 @@ function DefensePlanner.capital(world, plan)
 		end
 	end
 
-	ensureCapitalRing(world, plan, capitalTile)
+	ensureCapitalRing(world, plan, capitalTile, zoneThreatened)
 end
 
 function DefensePlanner.unsafe(world, plan, analysis, attackPlanner)
@@ -11407,6 +12067,9 @@ local REGISTRY = {
 	TryDeployPlanes = { path = "Planes/TryDeployPlanes", class = "RemoteFunction", args = "(city Folder, AirMap region Part, planeData {6 keys})", reply = "(ok, _)" },
 	TryMovePlanes = { path = "Planes/TryMovePlanes", class = "RemoteFunction", args = "(source city Folder, destination city Folder, planeData)", reply = "(ok, err)" },
 	TryRetreat = { path = "Planes/TryRetreat", class = "RemoteFunction", args = "(AirMap region Part)", reply = "truthy on success" },
+	-- [AIR-r5] Remotes baru untuk fitur airfield management.
+	TryUpgradeAirfield = { path = "Planes/TryUpgradeAirfield", class = "RemoteFunction", args = "(city Folder)", reply = "(ok, err)" },
+	SetAirfieldPriority = { path = "Planes/SetAirfieldPriority", class = "RemoteEvent", args = "(airfield Instance, enabled boolean)", reply = "airfield priority attribute" },
 	TryUpgradeShipyard = { path = "Economy/TryUpgradeShipyard", class = "RemoteFunction", args = "(city Folder)", reply = "(ok, err, nextTechName?) with err in 'No Money' | 'Research Required' | 'Max Level'" },
 	-- [FIX-A2] Terverifikasi dari ctw_dump.txt (REMOTES) + ctw_ui_source.txt 12611/12647: arg = country ObjectValue.
 	TryJustifyWar = { path = "Diplomacy/TryJustifyWar", class = "RemoteFunction", args = "(country ObjectValue)", reply = "(ok, msg)" },
@@ -13650,6 +14313,12 @@ function WarAI.onTick(world, analysis, plan)
 	EconomyPlanner.run(world, analysis)
 	ArmyControl.run(world, analysis)
 	AirPlanner.run(world, plan)
+	-- [AIR-r5] Fitur airfield management baru.
+	AirPlanner.runUpgrades(world, plan)
+	AirPlanner.runReposition(world, plan)
+	AirPlanner.runBuild(world)
+	AirPlanner.runPriority(world, plan)
+	AirPlanner.runNuke(world, plan)
 	-- [TODO-NAVY] aktifkan saat fitur navy dipakai
 	Ownership.verifyCounts()
 	-- [FIX-H12] resolveStopped tidak pernah dipanggil: predictions menumpuk & attacksLost selalu 0.
@@ -13696,6 +14365,20 @@ function WarAI.attach()
 	maid = Maid.new("WarAI")
 	WarAI.defineCoreSettings()
 
+	-- [FIX-GUI-ORDER] Muat GameModules + TechCatalog SEBELUM Menu.build().
+	-- Menu.build() memanggil getAvailableTechOptions() yang membaca TechCatalog.entries;
+	-- kalau TechCatalog belum di-build, dropdown "Add Tech to Queue" gagal dibuat dan
+	-- hilang dari GUI tanpa pesan error (di-swallow pcall).
+	if Session.isCorrectPlace() then
+		local okModules, errModules = pcall(GameModules.loadAll)
+		if okModules then
+			pcall(Remotes.verifyAll)
+			pcall(TechCatalog.build)
+		else
+			Logger.error("WarAI", "gameModulesLoadFailed", { message = tostring(errModules) })
+		end
+	end
+
 	-- [FIX-GUI] Rayfield bisa gagal (fetch kosong / executor memblokir HttpGet). Dulu itu
 	-- membatalkan SELURUH boot. Sekarang GUI opsional: AI tetap jalan tanpa GUI.
 	local menuOk, menuFailure = pcall(Menu.build, STATUS_KEYS, WarAI.detach)
@@ -13715,10 +14398,6 @@ function WarAI.attach()
 		WarAI.attached = true
 		return
 	end
-
-	GameModules.loadAll()
-	Remotes.verifyAll()
-	TechCatalog.build()
 
 	for _, signal in ipairs({
 		Session.countryChanged, Session.mapReplaced,
