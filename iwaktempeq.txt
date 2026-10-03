@@ -5994,7 +5994,6 @@ local STATES_THAT_CANNOT_MOVE = { Defending = true, Retreating = true, Dead = tr
 
 DefensePlanner.trappedReported = {}
 DefensePlanner.unguardedReported = false
-DefensePlanner.handoffs = DefensePlanner.handoffs or {}
 
 local function enemyNearZone(world, tileName)
 	if #FrontAnalyzer.adjacentEnemyUnits(world, tileName) > 0 then return true end
@@ -6013,137 +6012,63 @@ local function isRestTile(world, plan, tileName)
 		and SupplyModel.isSupplied(world, tileName)
 end
 
-local WOUNDED_THRESHOLD = 65
-local FRESH_THRESHOLD = 80
+-- =====================================================================
+-- [REST-HOLD] Unit sekarat: diam & heal sampai health >= 80.
+-- Menggantikan rotateWounded + blok rest lama.
+-- Aturan:
+--   * Saat perang saja.
+--   * Unit flagged (dieOnNextRetreat) ATAU health < 80 -> masuk mode diam.
+--   * Kalau ada musuh flagged / health < 80 di sekitar dengan
+--     ratio >= 1.3 dan health kita setelah menang >= 20 -> boleh serang.
+--   * Kalau sedang Attacking -> jangan diganggu (AR tier yang urus).
+--   * Kalau sedang Moving -> halt di tempat.
+--   * Kalau cut off supply -> bebas cari supply (termasuk rute berbahaya).
+-- =====================================================================
+local REST_HEALTH_THRESHOLD = 80
+local REST_ATTACK_RATIO_MIN = 1.3
+local REST_ATTACK_MIN_HEALTH_AFTER = 20
 
-local function findRestPath(world, plan, unit)
-	local isRest = function(tileName)
-		return isRestTile(world, plan, tileName)
-	end
+---Cari target musuh di sekitar unit sekarat yang layak diserang.
+---Kriteria musuh: flagged (pasti mati kalau kalah) ATAU health < 80.
+---Kriteria kita: menang solo dengan ratio >= REST_ATTACK_RATIO_MIN dan
+---health setelah menang >= REST_ATTACK_MIN_HEALTH_AFTER.
+---@param world table
+---@param unit table snapshot
+---@return string? targetTile, number ratio
+local function findRestAttackTarget(world, unit)
+	local bestTile = nil
+	local bestRatio = 0
 
-	local safePath = Tactics.nearestTile(world, plan, unit, isRest, true)
-	if safePath ~= nil then
-		return safePath
-	end
+	for _, nbr in ipairs(MapGraph.tiles[unit.tile].landNeighbours) do
+		local enemy = world.unitsByTile[nbr]
+		if enemy ~= nil and world.enemies[enemy.owner] then
+			local isFlagged = enemy.flagged or enemy.liveFlag
+			local isWeak = (enemy.health or 100) < 80
 
-	return nil
-end
+			if isFlagged or isWeak then
+				local engage = CombatModel.engage(world.combat,
+					{ { unit = unit, fromTile = unit.tile } },
+					enemy, nbr, "attacker")
 
-local function findFreshReplacement(world, plan, tileName)
-	for _, candidate in ipairs(Tactics.availableNeighbours(world, plan, tileName)) do
-		if candidate.owner == world.me
-			and not candidate.flagged
-			and candidate.health > FRESH_THRESHOLD then
-			local placed = CombatModel.placedOn(candidate, tileName)
-			local threat = CombatModel.threat(world.combat, world, tileName, placed)
-			if not threat.breaks then
-				return candidate
-			end
-		end
-	end
-
-	return nil
-end
-
-local function chooseHandoffTile(world, plan, frontTile, replacement)
-	local choices = {}
-	for _, neighbourName in ipairs(MapGraph.tiles[frontTile].landNeighbours) do
-		if neighbourName ~= replacement.tile
-			and world.tileOwner[neighbourName] == world.me
-			and world.unitsByTile[neighbourName] == nil
-			and plan:isFreeDestination(neighbourName)
-			and #FrontAnalyzer.adjacentEnemyUnits(world, neighbourName) == 0 then
-			table.insert(choices, neighbourName)
-		end
-	end
-	table.sort(choices)
-	return choices[1]
-end
-
-local function pendingHandoffIsLive(world, handoff)
-	local defender = world.unitsById[handoff.defenderId]
-	local replacement = world.unitsById[handoff.replacementId]
-	return defender ~= nil and replacement ~= nil
-		and defender.owner == world.me and replacement.owner == world.me
-		and defender.tile == handoff.frontTile
-		and replacement.tile ~= handoff.frontTile
-end
-
-local function processPendingHandoffs(world, plan)
-	for frontTile, handoff in pairs(DefensePlanner.handoffs) do
-		local defender = world.unitsById[handoff.defenderId]
-		local replacement = world.unitsById[handoff.replacementId]
-		if defender == nil or replacement == nil or replacement.owner ~= world.me then
-			DefensePlanner.handoffs[frontTile] = nil
-		elseif handoff.phase == "approach" then
-			if defender.tile ~= frontTile or replacement.tile == frontTile then
-				DefensePlanner.handoffs[frontTile] = nil
-			elseif replacement.tile == handoff.temporaryTile
-				and (replacement.state == "Idle" or replacement.state == "Waiting") then
-				local eta = Pathing.hopSeconds(world.paths, replacement, replacement.tile, frontTile)
-				if eta <= 1 then
-					local restPath = findRestPath(world, plan, defender)
-					if restPath ~= nil and plan:isAvailable(defender) then
-						plan:assign(defender, restPath, "rotateWoundedOut", TIER_ROTATION,
-							"replacement is within one second of the front tile",
-							{ health = defender.health, threshold = WOUNDED_THRESHOLD, replacementEta = eta, handoff = true })
-						handoff.phase = "retreating"
-						Logger.info("Features.Front.DefensePlanner", "woundedRetreatStarted", {
-							tile = frontTile, wounded = defender.id, replacement = replacement.id, replacementEta = eta,
-						})
+				if engage.breaks and not engage.tie
+					and engage.ratio >= REST_ATTACK_RATIO_MIN then
+					local healthAfter = engage.healthsAtBreak
+						and engage.healthsAtBreak[1] or 100
+					if healthAfter >= REST_ATTACK_MIN_HEALTH_AFTER
+						and engage.ratio > bestRatio then
+						bestRatio = engage.ratio
+						bestTile = nbr
 					end
 				end
 			end
-		elseif handoff.phase == "retreating" then
-			if world.unitsByTile[frontTile] == nil and plan:isAvailable(replacement) then
-				plan:assign(replacement, { replacement.tile, frontTile }, "rotateFreshIn", TIER_ROTATION,
-					"front tile confirmed empty after wounded unit withdrew",
-					{ health = replacement.health, handoff = true, temporaryTile = handoff.temporaryTile })
-				handoff.phase = "entering"
-				Logger.info("Features.Front.DefensePlanner", "woundedHandoffCompleted", {
-					tile = frontTile, wounded = handoff.defenderId, replacement = replacement.id,
-				})
-			elseif defender.tile == frontTile and (defender.state == "Idle" or defender.state == "Waiting") then
-				DefensePlanner.handoffs[frontTile] = nil
-			end
-		elseif handoff.phase == "entering" and replacement.tile == frontTile then
-			DefensePlanner.handoffs[frontTile] = nil
 		end
 	end
+
+	return bestTile, bestRatio
 end
 
-local function rotateWounded(world, plan, analysis)
-	processPendingHandoffs(world, plan)
-	local staged = 0
-	for tileName, defender in pairs(analysis.contact) do
-		if defender.health < WOUNDED_THRESHOLD
-			and not defender.flagged
-			and plan:isAvailable(defender)
-			and DefensePlanner.handoffs[tileName] == nil then
-			local replacement = findFreshReplacement(world, plan, tileName)
-			local temporaryTile = replacement and chooseHandoffTile(world, plan, tileName, replacement) or nil
-			if replacement ~= nil and temporaryTile ~= nil then
-				local arrival = Tactics.earliestArrival(world, plan, { replacement }, temporaryTile, nil)
-				if arrival ~= nil then
-					plan:assign(replacement, arrival.path, "rotateFreshApproach", TIER_ROTATION,
-						"replacement stages on a temporary empty tile before handoff",
-						{ health = replacement.health, handoff = true, frontTile = tileName, temporaryTile = temporaryTile, approachSeconds = arrival.seconds })
-					DefensePlanner.handoffs[tileName] = {
-						frontTile = tileName, defenderId = defender.id, replacementId = replacement.id,
-						temporaryTile = temporaryTile, phase = "approach",
-					}
-					staged += 1
-				end
-			end
-		end
-	end
-	if staged > 0 then
-		Logger.info("Features.Front.DefensePlanner", "woundedReplacementStaged", { count = staged, woundedThreshold = WOUNDED_THRESHOLD, freshThreshold = FRESH_THRESHOLD })
-	end
-end
-
-local CAPITAL_RING_SIZE = 2
-local CAPITAL_RING_MIN_TOTAL_UNITS = 4
+local CAPITAL_RING_SIZE = 0
+local CAPITAL_RING_MIN_TOTAL_UNITS = 2
 
 local function ensureCapitalRing(world, plan, capitalTile)
 	local record = MapGraph.tiles[capitalTile]
@@ -6461,163 +6386,55 @@ function DefensePlanner.lanes(world, plan, analysis)
 end
 
 function DefensePlanner.rotation(world, plan, analysis)
-	rotateWounded(world, plan, analysis)
+	local atWar = next(world.enemies) ~= nil
 
 	for _, unit in ipairs(world.ourUnits) do
-		if not unit.flagged and plan:isAvailable(unit) and world.tileOwner[unit.tile] == world.me and not SupplyModel.isSupplied(world, unit.tile) then
-			local isSuppliedFree = function(tileName)
-				return world.tileOwner[tileName] == world.me and plan:isFreeDestination(tileName) and SupplyModel.isSupplied(world, tileName)
-			end
-			local safePath = Tactics.nearestTile(world, plan, unit, isSuppliedFree, true)
-			local useDangerousFallback = (unit.health or 0) >= WOUNDED_THRESHOLD
-			local path = safePath
-			if path == nil and useDangerousFallback then
-				path = Tactics.nearestTile(world, plan, unit, isSuppliedFree, false)
-			end
-			if path ~= nil then
-				plan:assign(unit, path, "resupply", TIER_ROTATION, "cut off from supply: back to supplied land", { health = unit.health, noSupply = unit.noSupply, safe = safePath ~= nil })
-			elseif safePath == nil then
-				Logger.warn("Features.Front.DefensePlanner", "woundedTrappedNoSafeRoute", { unit = unit.id, tile = unit.tile, health = unit.health })
-			else
-				Logger.debug("Features.Front.DefensePlanner", "cutOffNoRoute", { unit = unit.id, tile = unit.tile })
-			end
-		end
-	end
-	for _, unit in ipairs(world.ourUnits) do
-		if unit.flagged and plan:isAvailable(unit) then
-			local exposure = #FrontAnalyzer.adjacentEnemyUnits(world, unit.tile)
-			if exposure > 0 then
-				local isRest = function(tileName) return isRestTile(world, plan, tileName) end
-				local path = Tactics.nearestTile(world, plan, unit, isRest, true)
-				local how = "safe route"
-				if path == nil then
-					path = Tactics.nearestTile(world, plan, unit, isRest, false)
-					how = "route past enemy units"
+		if plan:isAvailable(unit) and world.tileOwner[unit.tile] == world.me then
+			local health = unit.health or 0
+			local supplied = SupplyModel.isSupplied(world, unit.tile)
+
+			-- Prioritas 1: cut off supply -> resupply.
+			-- Berlaku untuk semua unit (termasuk yang sekarat), karena tanpa
+			-- supply unit sekarat tidak akan pernah heal.
+			if not supplied then
+				local isSuppliedFree = function(tileName)
+					return world.tileOwner[tileName] == world.me
+						and plan:isFreeDestination(tileName)
+						and SupplyModel.isSupplied(world, tileName)
 				end
+				local safePath = Tactics.nearestTile(world, plan, unit, isSuppliedFree, true)
+				local path = safePath
 				if path == nil then
-					local bestTile = nil
-					local bestExposure = exposure
-					for _, neighbourName in ipairs(MapGraph.tiles[unit.tile].landNeighbours) do
-						local owner = world.tileOwner[neighbourName]
-						local neighbourExposure = #FrontAnalyzer.adjacentEnemyUnits(world, neighbourName)
-						if owner ~= nil and WorldView.friendsOf(world, world.me)[owner] and plan:isFreeDestination(neighbourName) and neighbourExposure < bestExposure then
-							bestTile = neighbourName
-							bestExposure = neighbourExposure
-						end
-					end
-					if bestTile ~= nil then
-						path = { unit.tile, bestTile }
-						how = string.format("one tile to fewer enemy neighbours (%d -> %d)", exposure, bestExposure)
-					end
+					-- Rute berbahaya: selalu coba, karena stuck = mati pelan-pelan.
+					path = Tactics.nearestTile(world, plan, unit, isSuppliedFree, false)
 				end
 				if path ~= nil then
-					plan:assign(unit, path, "rest", TIER_ROTATION, "flagged unit next to an enemy dies when beaten", { health = unit.health, how = how })
+					plan:assign(unit, path, "resupply", TIER_ROTATION,
+						"cut off from supply: back to supplied land",
+						{ health = unit.health, noSupply = unit.noSupply, safe = safePath ~= nil })
 				else
-					plan:hold(unit, "rest", TIER_ROTATION, "flagged, no safe tile reachable")
-					if DefensePlanner.trappedReported[unit.id] ~= unit.tile then
-						DefensePlanner.trappedReported[unit.id] = unit.tile
-						Logger.warn("Features.Front.DefensePlanner", "flaggedTrapped", { unit = unit.id, tile = unit.tile, troop = unit.troopName, health = unit.health })
+					Logger.warn("Features.Front.DefensePlanner", "woundedTrappedNoSafeRoute",
+						{ unit = unit.id, tile = unit.tile, health = unit.health })
+				end
+
+			-- Prioritas 2: sekarat & disupply & sedang perang -> rest-hold.
+			elseif atWar then
+				local isDying = unit.flagged or health < REST_HEALTH_THRESHOLD
+				if isDying and unit.state ~= "Attacking" then
+					local targetTile, targetRatio = findRestAttackTarget(world, unit)
+					if targetTile ~= nil then
+						plan:assign(unit, { unit.tile, targetTile }, "restAttack",
+							TIER_ROTATION,
+							string.format("sekarat tapi ada target lemah (ratio %.2f)", targetRatio),
+							{ ratio = targetRatio, targetTile = targetTile })
+					elseif unit.state == "Moving" then
+						-- Q3-A: halt supaya benar-benar berhenti di tempat.
+						plan:halt(unit, TIER_ROTATION,
+							string.format("sekarat: halt, heal %d -> %d", health, REST_HEALTH_THRESHOLD))
+					else
+						plan:hold(unit, "restHold", TIER_ROTATION,
+							string.format("sekarat: heal %d -> %d", health, REST_HEALTH_THRESHOLD))
 					end
-				end
-			else
-				plan:hold(unit, "rest", TIER_ROTATION, "flagged: heals only while Idle")
-			end
-		end
-	end
-end
-
-function DefensePlanner.gaps(world, plan, analysis)
-	if world.coastalThreats ~= nil and #world.coastalThreats > 0 then
-		for _, site in ipairs(world.coastalThreats) do
-			if plan:isFreeDestination(site.tile) and site.garrisonHealth == 0 then
-				local candidates = {}
-				for _, unit in ipairs(plan:availableUnits()) do
-					if not unit.flagged and analysis.contact[unit.tile] == nil then
-						table.insert(candidates, unit)
-					end
-				end
-				if #candidates > 0 then
-					local deadline = (Tick.periodSeconds() or 3.0) * 2
-					local best, ranked = Tactics.earliestArrival(world, plan, candidates, site.tile, deadline)
-					if best ~= nil and best.seconds < deadline then
-						local placed = CombatModel.placedOn(best.unit, site.tile)
-						local threat = CombatModel.threat(world.combat, world, site.tile, placed)
-						if not threat.breaks then
-							plan:decide(TIER_RESERVES, "coastGuard:" .. site.tile, ranked,
-								"enemy invasion force approaching")
-							plan:assign(best.unit, best.path, "coastGuard", TIER_RESERVES,
-								string.format("block coast landing (%d enemy divisions at sea)", site.divisions),
-								{ seconds = best.seconds, divisions = site.divisions, threatRatio = threat.ratio })
-							Logger.info("Features.Front.DefensePlanner", "coastGuarded", {
-								tile = site.tile, divisions = site.divisions, ourEta = best.seconds,
-							})
-							break
-						end
-					end
-				end
-			end
-		end
-	end
-	for _, gap in ipairs(analysis.gaps) do
-		if plan:isFreeDestination(gap.tile) then
-			local candidates = {}
-			for _, unit in ipairs(plan:availableUnits()) do
-				if not unit.flagged and analysis.contact[unit.tile] == nil then table.insert(candidates, unit) end
-			end
-			if #candidates == 0 then break end
-			local best, ranked = Tactics.earliestArrival(world, plan, candidates, gap.tile, gap.enemyEntrySeconds)
-			if best ~= nil then
-				local placed = CombatModel.placedOn(best.unit, gap.tile)
-				local threat = CombatModel.threat(world.combat, world, gap.tile, placed)
-				if not threat.breaks then
-					plan:decide(TIER_RESERVES, "coverGap:" .. gap.tile, ranked, "earliest arrival before the enemy could walk in")
-					plan:assign(best.unit, best.path, "coverGap", TIER_RESERVES, "our empty tile next to an enemy", {
-						seconds = best.seconds, enemyEntrySeconds = gap.enemyEntrySeconds, threatRatio = threat.ratio, consequence = gap.consequence,
-					})
-				end
-			end
-		end
-	end
-	local incoming = FrontAnalyzer.incomingMoves(world)
-
-	for _, entry in ipairs(incoming) do
-		if plan:isFreeDestination(entry.targetTile) and world.unitsByTile[entry.targetTile] == nil then
-			local candidates = {}
-			for _, unit in ipairs(plan:availableUnits()) do
-				if not unit.flagged and analysis.contact[unit.tile] == nil then
-					table.insert(candidates, unit)
-				end
-			end
-
-			if #candidates == 0 then
-				break
-			end
-
-			local deadline = entry.eta * 0.9
-			local best, ranked = Tactics.earliestArrival(world, plan, candidates, entry.targetTile, deadline)
-
-			if best ~= nil and best.seconds < entry.eta then
-				local placed = CombatModel.placedOn(best.unit, entry.targetTile)
-				local threat = CombatModel.threat(world.combat, world, entry.targetTile, placed)
-
-				if not threat.breaks then
-					plan:decide(TIER_RESERVES, "preCover:" .. entry.targetTile, ranked,
-						"enemy incoming move predicted")
-					plan:assign(best.unit, best.path, "preCoverGap", TIER_RESERVES,
-						"pre-position for incoming enemy move",
-						{
-							seconds = best.seconds,
-							enemyEta = entry.eta,
-							threatRatio = threat.ratio,
-							enemyUnitId = entry.unitId,
-						})
-
-					Logger.info("Features.Front.DefensePlanner", "preCoveredGap", {
-						tile = entry.targetTile,
-						enemyUnit = entry.unitId,
-						enemyEta = entry.eta,
-						ourEta = best.seconds,
-					})
 				end
 			end
 		end
@@ -9899,8 +9716,19 @@ function OrderExecutor.execute(world, plan, canSend)
 					})
 				end
 			else
+				-- [ONE-HOP] At war, send only the first hop. The Scheduler's
+				-- ourUnitIdle trigger fires when the unit arrives, which
+				-- schedules a combat cycle immediately; the planner then
+				-- re-assigns the next hop from the unit's new position.
+				-- At peace, send the full path (no per-hop re-plan needed).
+				local pathToSend = order.path
+				local atWar = next(world.enemies) ~= nil
+				if atWar and #order.path > 2 then
+					pathToSend = { order.path[1], order.path[2] }
+				end
+
 				local instances = {}
-				for _, tileName in ipairs(order.path) do
+				for _, tileName in ipairs(pathToSend) do
 					table.insert(instances, MapGraph.tiles[tileName].instance)
 				end
 
@@ -9912,13 +9740,13 @@ function OrderExecutor.execute(world, plan, canSend)
 				local pendingEntry = {
 					order = order,
 					sentClock = os.clock(),
-					expectedTarget = order.path[TARGET_INDEX],
-					expectedPathFromTarget = pathJson(order.path, TARGET_INDEX),
+					expectedTarget = pathToSend[TARGET_INDEX],
+					expectedPathFromTarget = pathJson(pathToSend, TARGET_INDEX),
 					expectedPathAfterTarget = nil,
 				}
 
-				if #order.path >= PATH_AFTER_TARGET_START then
-					pendingEntry.expectedPathAfterTarget = pathJson(order.path, PATH_AFTER_TARGET_START)
+				if #pathToSend >= PATH_AFTER_TARGET_START then
+					pendingEntry.expectedPathAfterTarget = pathJson(pathToSend, PATH_AFTER_TARGET_START)
 				end
 
 				OrderExecutor.pending[order.unitId] = pendingEntry
