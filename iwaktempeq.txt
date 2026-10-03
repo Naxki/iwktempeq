@@ -347,6 +347,8 @@ local ATTACK_PURPOSES = {
 	walkIn = true, cutWalkIn = true, chase = true, attackContinue = true, attackPin = true,
 	-- [FIX-CAP-3] purpose baru dari AttackPlanner.corridorSecurity
 	corridorClear = true,
+	-- [HUNT] CAS juga bantu hunt biar pembunuhan lebih cepat.
+	hunt = true,
 }
 
 Formula.define({
@@ -5578,6 +5580,8 @@ local TIER_CAPITAL = "A0"
 local TIER_CORRIDOR = "A0b"
 local TIER_KILL = "A2"
 local TIER_PINCER = "A5"
+-- [HUNT] Tier A6: kejar musuh killable off-poros untuk cegah flank.
+local TIER_HUNT = "A6"
 local TIER_CUT = "A3"
 local TIER_CAPTURE = "A4"
 local TIER_REVIEW = "AR"
@@ -6413,6 +6417,175 @@ function AttackPlanner.pincers(world, plan)
 	if plan.pendingPincer ~= true then
 		plan.pendingPincer = false
 	end
+end
+
+-- [HUNT] ====================================================================
+-- Tier A6: kejar musuh KILLABLE yang belum ditangani tier atas.
+-- Tujuan: musuh off-poros yang bebas berkeliaran (flanker potensial) dihabisi
+-- sebelum mereka memotong supply kita atau bergabung ke stack besar.
+--
+-- Filter berlapis (semua harus lolos):
+--   1. Musuh belum ditangani tier A0-A5 (tidak ada di plan.orders)
+--   2. Bukan Retreating/Dead/flagged
+--   3. < 3 musuh adjacent (hindari trap stack)
+--   4. Ada unit kita dalam radius maxHops
+--   5. Tactics.winningStack menghasilkan margin >= minRatio
+--   6. Health setelah menang >= minHealthAfter
+--   7. Tactics.safeAfterFight: tidak akan mati oleh counter
+--
+-- Cap MAX_HUNTS_PER_CYCLE untuk menjaga komputasi. Sisanya besok lagi.
+-- ============================================================================
+local MAX_HUNTS_PER_CYCLE = 3
+local HUNT_AVG_EDGE_STUDS = 15
+
+function AttackPlanner.hunt(world, plan, opts)
+	opts = opts or {}
+	local minRatio = opts.minRatio or 1.5
+	local minHealthAfter = opts.minHealthAfter or 40
+	local maxHops = opts.maxHops or 6
+	local maxStuds = maxHops * HUNT_AVG_EDGE_STUDS
+
+	-- 1. Target yang sudah ditangani tier atas.
+	local alreadyTargeted = {}
+	for _, order in ipairs(plan.orders) do
+		if order.isAttack then
+			alreadyTargeted[order.destination] = true
+		end
+	end
+
+	-- 2. Kandidat unit kita: belum diassign, cukup sehat, tidak cut supply.
+	local ourCandidates = {}
+	for _, unit in ipairs(plan:availableUnits()) do
+		if not unit.flagged
+			and unit.state ~= "Attacking"
+			and (unit.health or 0) >= MIN_ATTACK_HEALTH
+			and SupplyModel.isSupplied(world, unit.tile)
+		then
+			local record = MapGraph.tiles[unit.tile]
+			if record ~= nil then
+				table.insert(ourCandidates, { unit = unit, position = record.position })
+			end
+		end
+	end
+	if #ourCandidates == 0 then
+		return { hunted = 0, reason = "no candidate units" }
+	end
+
+	-- 3. Kumpulkan musuh yang layak dihunt.
+	local targets = {}
+	for _, enemy in ipairs(world.enemyUnits) do
+		if not alreadyTargeted[enemy.tile]
+			and enemy.state ~= "Retreating"
+			and enemy.state ~= "Dead"
+			and not enemy.flagged
+		then
+			local adjacent = FrontAnalyzer.adjacentEnemyUnits(world, enemy.tile)
+			if #adjacent < 3 then
+				table.insert(targets, enemy)
+			end
+		end
+	end
+	if #targets == 0 then
+		return { hunted = 0, reason = "no eligible targets" }
+	end
+
+	-- 4. Sort: musuh dengan health terendah dulu (kill termurah dulu).
+	table.sort(targets, function(a, b)
+		if (a.health or 100) ~= (b.health or 100) then
+			return (a.health or 100) < (b.health or 100)
+		end
+		return a.id < b.id
+	end)
+
+	-- 5. Untuk setiap target, cari unit kita terdekat dalam radius dan cek stack.
+	local hunted = 0
+	for _, enemy in ipairs(targets) do
+		if hunted >= MAX_HUNTS_PER_CYCLE then break end
+
+		local enemyPos = MapGraph.tiles[enemy.tile].position
+
+		local closeCandidates = {}
+		for _, entry in ipairs(ourCandidates) do
+			if plan:isAvailable(entry.unit) then
+				local dist = (entry.position - enemyPos).Magnitude
+				if dist <= maxStuds then
+					table.insert(closeCandidates, { unit = entry.unit, distance = dist })
+				end
+			end
+		end
+
+		if #closeCandidates > 0 then
+			table.sort(closeCandidates, function(a, b)
+				if a.distance ~= b.distance then return a.distance < b.distance end
+				return a.unit.id < b.unit.id
+			end)
+
+			-- Cap kandidat untuk winningStack (limit komputasi).
+			local candidateUnits = {}
+			local cap = math.min(#closeCandidates, MAX_STACK_PREFILTER)
+			for i = 1, cap do
+				table.insert(candidateUnits, closeCandidates[i].unit)
+			end
+
+			local stack = Tactics.winningStack(world, plan, enemy.tile, candidateUnits)
+			if stack ~= nil
+				and #stack.attackers > 0
+				and stack.result.ratio >= minRatio
+			then
+				-- 6. Cek health setelah menang.
+				local minHealth = 100
+				local hpList = stack.result.healthsAtBreak or stack.result.finalHealths or {}
+				for _, h in ipairs(hpList) do
+					if type(h) == "number" and h < minHealth then
+						minHealth = h
+					end
+				end
+
+				if minHealth >= minHealthAfter then
+					-- 7. Cek apakah aman setelah fight (tidak akan mati oleh counter).
+					local allSafe = true
+					for idx, entry in ipairs(stack.all) do
+						local hpAtBreak = stack.result.healthsAtBreak and stack.result.healthsAtBreak[idx]
+						local hp = hpAtBreak or entry.unit.health or 100
+						local safe = Tactics.safeAfterFight(world, entry, hp, enemy.tile)
+						if not safe then
+							allSafe = false
+							break
+						end
+					end
+
+					if allSafe then
+						launch(plan, stack, enemy.tile, "hunt", TIER_HUNT,
+							string.format("hunt %s at %s (ratio %.2f, hp-after %.0f)",
+								enemy.troopName or "enemy", enemy.tile, stack.result.ratio, minHealth))
+						hunted += 1
+						Logger.info("Features.Front.AttackPlanner", "huntLaunch", {
+							target = enemy.tile, troop = enemy.troopName,
+							ratio = stack.result.ratio, attackers = #stack.attackers,
+							minHealthAfter = minHealth,
+						})
+					else
+						Logger.debug("Features.Front.AttackPlanner", "huntUnsafeAfter", {
+							target = enemy.tile, ratio = stack.result.ratio,
+						})
+					end
+				else
+					Logger.debug("Features.Front.AttackPlanner", "huntLowHealth", {
+						target = enemy.tile, ratio = stack.result.ratio, minHealth = minHealth,
+					})
+				end
+			end
+		end
+	end
+
+	if hunted > 0 then
+		Logger.info("Features.Front.AttackPlanner", "hunt", {
+			hunted = hunted, targets = #targets, candidates = #ourCandidates,
+			minRatio = minRatio, maxHops = maxHops,
+		})
+	end
+
+	return { hunted = hunted, targets = #targets, candidates = #ourCandidates }
 end
 
 local function ownNeighbourCount(world, plan, tileName)
@@ -7862,6 +8035,44 @@ local NavyPlanner = require("Features/Navy/NavyPlanner")
 local DEFCON_CAPITAL_RADIUS = 3
 local DEFCON_MIN_AGGRESSORS = 3
 
+-- [HUNT] Adaptive aggressiveness: skala ambang hunt dengan rasio kekuatan kita vs musuh terkuat.
+--   ratio >= 2.0  -> aggressive (minRatio 1.2, healthAfter 35, 6 hop)
+--   0.8 <= r <2.0 -> normal    (minRatio 1.5, healthAfter 40, 6 hop)
+--   ratio < 0.8   -> passive   (minRatio 2.0, healthAfter 50, 4 hop)
+-- Tujuan: saat kita lemah, hunt sangat konservatif; saat kuat, hunt agresif.
+local function computeHuntThresholds(world)
+	local ourPower = 0
+	for _, u in ipairs(world.ourUnits) do
+		if u.state ~= "Dead" then
+			ourPower += (u.attack or 1) * (u.health or 1)
+		end
+	end
+
+	local enemyMaxPower = 0
+	for enemyName in pairs(world.enemies) do
+		local power = 0
+		for _, u in ipairs(world.unitsOf[enemyName] or {}) do
+			if u.state ~= "Dead" then
+				power += (u.attack or 1) * (u.health or 1)
+			end
+		end
+		if power > enemyMaxPower then enemyMaxPower = power end
+	end
+
+	local ratio = ourPower / math.max(enemyMaxPower, 1)
+
+	if ratio >= 2.0 then
+		return { minRatio = 1.2, minHealthAfter = 35, maxHops = 6,
+			powerRatio = ratio, mode = "aggressive" }
+	elseif ratio >= 0.8 then
+		return { minRatio = 1.5, minHealthAfter = 40, maxHops = 6,
+			powerRatio = ratio, mode = "normal" }
+	else
+		return { minRatio = 2.0, minHealthAfter = 50, maxHops = 4,
+			powerRatio = ratio, mode = "passive" }
+	end
+end
+
 local function lockSpawnTile(world, plan)
 	local army = world.meInstance:FindFirstChild("Army")
 	local cityName = army and army:GetAttribute("priorityCity")
@@ -7934,6 +8145,10 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 
 	lockSpawnTile(world, plan)
 
+	-- [HUNT] Adaptive aggressiveness threshold untuk tier A6.
+	local huntThresholds = computeHuntThresholds(world)
+	Logger.debug("Features.Front.FrontPlanner", "huntThresholds", huntThresholds)
+
 	plan:beginTier("T0")
 	Profiler.run("Front_RetreatLocks", RetreatManager.protect, world, plan, analysis)
 	Profiler.run("Front_T0_Capital", DefensePlanner.capital, world, plan)
@@ -7989,6 +8204,10 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 			plan:beginTier("A5")
 			Profiler.run("Front_A5_Pincers", AttackPlanner.pincers, world, plan)
 		end
+
+		-- [HUNT] Tier A6: kejar musuh killable off-poros untuk cegah flank.
+		plan:beginTier("A6")
+		Profiler.run("Front_A6_Hunt", AttackPlanner.hunt, world, plan, huntThresholds)
 
 		if #plan:availableUnits() > 0 then
 			plan:beginTier("A3")
@@ -8054,9 +8273,10 @@ local Tracer = require("Utility/Tracer")
 local Formula = require("Utility/Formula")
 
 local ORDERABLE_STATES = { Idle = true, Moving = true, Waiting = true, Attacking = true }
-local TIER_RANK = { T0 = 1, T1 = 2, A1 = 2, T2 = 3, T3 = 4, A0a = 5, A0b = 6, A0 = 7, A2 = 8, A5 = 9, A3 = 10, A4 = 10, AR = 11, T4 = 12, R = 13, P = 14, BP = 15, G = 16 }
+-- [HUNT] A6 = tier hunt (di antara A5 pincers dan A3 captures).
+local TIER_RANK = { T0 = 1, T1 = 2, A1 = 2, T2 = 3, T3 = 4, A0a = 5, A0b = 6, A0 = 7, A2 = 8, A5 = 9, A6 = 9.5, A3 = 10, A4 = 10, AR = 11, T4 = 12, R = 13, P = 14, BP = 15, G = 16 }
 local UNKNOWN_TIER_RANK = math.huge
-local OFFENSIVE_TIERS = { A0a = true, A0b = true, A0 = true, A2 = true, A3 = true, A4 = true, A5 = true, AR = true }
+local OFFENSIVE_TIERS = { A0a = true, A0b = true, A0 = true, A2 = true, A3 = true, A4 = true, A5 = true, A6 = true, AR = true }
 
 Plan.TIER_RANK = TIER_RANK
 Plan.recentlyClearedTiles = {}
@@ -10943,7 +11163,7 @@ local CombatModel = require("Features/Combat/CombatModel")
 local OrderExecutor = require("Features/Orders/OrderExecutor")
 
 -- Constants.
-local ATTACK_PURPOSES = { capitalStrike = true, kill = true, surroundKill = true, relief = true, attack = true, cutOffAttack = true, pincerCut = true }
+local ATTACK_PURPOSES = { capitalStrike = true, kill = true, surroundKill = true, relief = true, attack = true, cutOffAttack = true, pincerCut = true, hunt = true }
 local BEATEN_STATES = { Retreating = true, Dead = true }
 -- [BUGFIX-C4]
 local MAX_BREAK_ERROR_SAMPLES = 256
