@@ -6441,6 +6441,104 @@ function DefensePlanner.rotation(world, plan, analysis)
 	end
 end
 
+function DefensePlanner.gaps(world, plan, analysis)
+	if world.coastalThreats ~= nil and #world.coastalThreats > 0 then
+		for _, site in ipairs(world.coastalThreats) do
+			if plan:isFreeDestination(site.tile) and site.garrisonHealth == 0 then
+				local candidates = {}
+				for _, unit in ipairs(plan:availableUnits()) do
+					if not unit.flagged and analysis.contact[unit.tile] == nil then
+						table.insert(candidates, unit)
+					end
+				end
+				if #candidates > 0 then
+					local deadline = (Tick.periodSeconds() or 3.0) * 2
+					local best, ranked = Tactics.earliestArrival(world, plan, candidates, site.tile, deadline)
+					if best ~= nil and best.seconds < deadline then
+						local placed = CombatModel.placedOn(best.unit, site.tile)
+						local threat = CombatModel.threat(world.combat, world, site.tile, placed)
+						if not threat.breaks then
+							plan:decide(TIER_RESERVES, "coastGuard:" .. site.tile, ranked,
+								"enemy invasion force approaching")
+							plan:assign(best.unit, best.path, "coastGuard", TIER_RESERVES,
+								string.format("block coast landing (%d enemy divisions at sea)", site.divisions),
+								{ seconds = best.seconds, divisions = site.divisions, threatRatio = threat.ratio })
+							Logger.info("Features.Front.DefensePlanner", "coastGuarded", {
+								tile = site.tile, divisions = site.divisions, ourEta = best.seconds,
+							})
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+	for _, gap in ipairs(analysis.gaps) do
+		if plan:isFreeDestination(gap.tile) then
+			local candidates = {}
+			for _, unit in ipairs(plan:availableUnits()) do
+				if not unit.flagged and analysis.contact[unit.tile] == nil then table.insert(candidates, unit) end
+			end
+			if #candidates == 0 then break end
+			local best, ranked = Tactics.earliestArrival(world, plan, candidates, gap.tile, gap.enemyEntrySeconds)
+			if best ~= nil then
+				local placed = CombatModel.placedOn(best.unit, gap.tile)
+				local threat = CombatModel.threat(world.combat, world, gap.tile, placed)
+				if not threat.breaks then
+					plan:decide(TIER_RESERVES, "coverGap:" .. gap.tile, ranked, "earliest arrival before the enemy could walk in")
+					plan:assign(best.unit, best.path, "coverGap", TIER_RESERVES, "our empty tile next to an enemy", {
+						seconds = best.seconds, enemyEntrySeconds = gap.enemyEntrySeconds, threatRatio = threat.ratio, consequence = gap.consequence,
+					})
+				end
+			end
+		end
+	end
+	local incoming = FrontAnalyzer.incomingMoves(world)
+
+	for _, entry in ipairs(incoming) do
+		if plan:isFreeDestination(entry.targetTile) and world.unitsByTile[entry.targetTile] == nil then
+			local candidates = {}
+			for _, unit in ipairs(plan:availableUnits()) do
+				if not unit.flagged and analysis.contact[unit.tile] == nil then
+					table.insert(candidates, unit)
+				end
+			end
+
+			if #candidates == 0 then
+				break
+			end
+
+			local deadline = entry.eta * 0.9
+			local best, ranked = Tactics.earliestArrival(world, plan, candidates, entry.targetTile, deadline)
+
+			if best ~= nil and best.seconds < entry.eta then
+				local placed = CombatModel.placedOn(best.unit, entry.targetTile)
+				local threat = CombatModel.threat(world.combat, world, entry.targetTile, placed)
+
+				if not threat.breaks then
+					plan:decide(TIER_RESERVES, "preCover:" .. entry.targetTile, ranked,
+						"enemy incoming move predicted")
+					plan:assign(best.unit, best.path, "preCoverGap", TIER_RESERVES,
+						"pre-position for incoming enemy move",
+						{
+							seconds = best.seconds,
+							enemyEta = entry.eta,
+							threatRatio = threat.ratio,
+							enemyUnitId = entry.unitId,
+						})
+
+					Logger.info("Features.Front.DefensePlanner", "preCoveredGap", {
+						tile = entry.targetTile,
+						enemyUnit = entry.unitId,
+						enemyEta = entry.eta,
+						ourEta = best.seconds,
+					})
+				end
+			end
+		end
+	end
+end
+
 function DefensePlanner.stage(world, plan, analysis)
 	local supportTiles = {}
 	local seen = {}
