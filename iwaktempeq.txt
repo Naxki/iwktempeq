@@ -7419,6 +7419,9 @@ function OrderExecutor.execute(world, plan, canSend)
 					table.insert(instances, MapGraph.tiles[tileName].instance)
 				end
 
+				Logger.info("Features.Orders.OrderExecutor", "debugSendPre",
+					{ unit = order.unitId, path = order.path, purpose = order.purpose,
+					  serverTime = workspace:GetServerTimeNow() })
 				Remotes.send("MoveTroop", instances)
 
 				OrderExecutor.userControlled[order.unitId] = nil
@@ -7437,6 +7440,9 @@ function OrderExecutor.execute(world, plan, canSend)
 				end
 
 				OrderExecutor.pending[order.unitId] = pendingEntry
+				pendingEntry.sentServerTime = workspace:GetServerTimeNow()
+				Logger.info("Features.Orders.OrderExecutor", "debugSendPost",
+					{ unit = order.unitId, serverTime = pendingEntry.sentServerTime })
 				OrderExecutor.committed[order.unitId] = {
 					path = order.path,
 					purpose = order.purpose,
@@ -7492,6 +7498,12 @@ local function onUnitChanged(record, attributeName, value)
 	local pendingEntry = OrderExecutor.pending[record.id]
 
 	if pendingEntry ~= nil then
+		if attributeName == "targetTile" or attributeName == "currentPath" or attributeName == "state" then
+			Logger.info("Features.Orders.OrderExecutor", "debugAttrChange",
+				{ unit = record.id, attr = attributeName, value = value,
+				  expectedTarget = pendingEntry.expectedTarget,
+				  serverTime = workspace:GetServerTimeNow() })
+		end
 		local accepted = (attributeName == "targetTile" and value == pendingEntry.expectedTarget)
 			or (attributeName == "currentPath" and (value == pendingEntry.expectedPathFromTarget or (pendingEntry.expectedPathAfterTarget ~= nil and value == pendingEntry.expectedPathAfterTarget)))
 
@@ -7617,6 +7629,9 @@ local function checkTimeouts()
 				Logger.error("Features.Orders.OrderExecutor", "orderNotAccepted", {
 					unit = unitId,
 					path = pendingEntry.order.path,
+					sentServerTime = pendingEntry.sentServerTime,
+					nowServerTime = workspace:GetServerTimeNow(),
+					elapsedSeconds = workspace:GetServerTimeNow() - (pendingEntry.sentServerTime or 0),
 					purpose = pendingEntry.order.purpose,
 					waitedSeconds = now - pendingEntry.sentClock,
 					boundSeconds = period,
@@ -10157,18 +10172,24 @@ MODULE_SOURCES["Utility/Logger"] = [=[
 local Logger = {}
 
 Logger.LEVELS = { "TRACE", "DEBUG", "INFO", "WARN", "ERROR" }
-Logger.activeLevel = "WARN"           -- [OPTIMASI] default WARN, bukan INFO
-Logger.counts = nil                    -- dimatikan: hemat kerja per-call
+Logger.activeLevel = "INFO"           -- [DEBUG] sementara untuk analisis
+Logger.counts = nil
 Logger.lastByLevel = {}
 Logger.sinks = {}
 Logger.pendingRecords = {}
 Logger.contextProvider = nil
 
+-- Level thresholds (integer)
+local TRACE_LVL, DEBUG_LVL, INFO_LVL, WARN_LVL, ERROR_LVL = 1, 2, 3, 4, 5
+local LEVEL_RANK = { TRACE = TRACE_LVL, DEBUG = DEBUG_LVL, INFO = INFO_LVL, WARN = WARN_LVL, ERROR = ERROR_LVL }
+-- [FIX] activeRank otomatis ikut activeLevel; tidak bisa lupa sinkron lagi
+Logger.activeRank = LEVEL_RANK[Logger.activeLevel] or INFO_LVL
+
 -- File sink config
 Logger.filePath = "CTW_WarAI_log.txt"
-Logger.maxBuffer = 500                 -- [OPTIMASI] 500 baris per flush
-Logger.flushInterval = 5.0             -- [OPTIMASI] 5 detik per flush
-Logger.dedupInterval = 30             -- [OPTIMASI] event sama di-skip 5s
+Logger.maxBuffer = 500
+Logger.flushInterval = 5.0
+Logger.dedupInterval = 0              -- [DEBUG] matikan dedup
 Logger.buffer = {}
 Logger.bufferSize = 0
 Logger.lastFlush = 0
@@ -10187,10 +10208,6 @@ end
 if not Logger.fileOk then
 	Logger.fallbackToPrint = true
 end
-
--- Level thresholds (integer, cepat dibanding tabel)
-local TRACE_LVL, DEBUG_LVL, INFO_LVL, WARN_LVL, ERROR_LVL = 1, 2, 3, 4, 5
-Logger.activeRank = WARN_LVL
 
 local function accepts(rank) return rank >= Logger.activeRank end
 
