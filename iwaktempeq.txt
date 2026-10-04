@@ -176,6 +176,85 @@ end
 return Tracer.instrument("Features.Review.Dashboard", Dashboard)
 ]=]
 
+
+MODULE_SOURCES["Features/Combat/OperationPlanner"] = [=[
+--[[
+	Features/Combat/OperationPlanner
+
+	Wave 4 beam-lite operation scorer. This is not full minimax; it is a safe
+	operation layer that annotates already-generated offensive orders so the
+	executor can prefer decisive same-tier operations first when the user enables
+	combat.operationPlanner.
+]]
+
+local OperationPlanner = {}
+
+local Logger = require("Utility/Logger")
+local Tracer = require("Utility/Tracer")
+local Settings = require("Features/Core/Settings")
+
+local PURPOSE_WEIGHT = {
+	capitalStrike = 10000,
+	capitalSurround = 8500,
+	surroundKill = 6500,
+	kill = 5200,
+	corridorClear = 4800,
+	pincerCut = 4600,
+	cutOffAttack = 3800,
+	relief = 3600,
+	hunt = 2200,
+	attack = 1800,
+	pathClear = 1600,
+}
+
+local function enabled()
+	local ok, value = pcall(Settings.get, "combat.operationPlanner")
+	return ok and value == true
+end
+
+local function scoreOrder(order)
+	local facts = order.facts or {}
+	local score = PURPOSE_WEIGHT[order.purpose] or (order.isAttack and 1000 or 0)
+
+	if type(facts.ratio) == "number" then
+		score += math.min(facts.ratio, 3.0) * 350
+	end
+	if type(facts.breakSeconds) == "number" then
+		score += 500 / math.max(0.5, facts.breakSeconds)
+	end
+	if type(facts.stackSize) == "number" then
+		score -= math.max(0, facts.stackSize - 4) * 80
+	end
+	if order.purpose == "capitalStrike" then
+		score += 2500
+	end
+
+	return score
+end
+
+function OperationPlanner.run(world, plan)
+	if not enabled() then return nil end
+
+	local tagged = 0
+	for _, order in ipairs(plan.orders or {}) do
+		if order.isAttack or PURPOSE_WEIGHT[order.purpose] ~= nil then
+			order.facts = order.facts or {}
+			order.facts.operationScore = scoreOrder(order)
+			order.facts.operationId = tostring(order.purpose) .. ":" .. tostring(order.destination)
+			tagged += 1
+		end
+	end
+
+	if tagged > 0 then
+		Logger.info("Features.Combat.OperationPlanner", "tagged", { orders = tagged })
+	end
+	return { tagged = tagged }
+end
+
+return Tracer.instrument("Features.Combat.OperationPlanner", OperationPlanner)
+
+]=]
+
 MODULE_SOURCES["Features/Front/ThreatHeat"] = [=[
 --[[
 	Features/Front/ThreatHeat
@@ -325,6 +404,9 @@ local Serializer = require("Utility/Serializer")
 
 ---@module Game.MapGraph
 local MapGraph = require("Game/MapGraph")
+
+---@module Features.Front.ThreatHeat
+local ThreatHeat = require("Features/Front/ThreatHeat")
 
 ---@module Features.Core.Settings
 local Settings = require("Features/Core/Settings")
@@ -523,11 +605,19 @@ function AirPlanner.run(world, plan)
 		if ATTACK_PURPOSES[order.purpose] then
 			local regionName = MapGraph.tiles[order.destination].airRegion
 			if regionName ~= nil then
-				-- Skor: stack besar * (1 - ratio). Region yang attacknya marginal
-				-- mendapat prioritas CAS tertinggi karena butuh damage bonus.
+				-- [CAS-MARGINAL] Skor CAS: attack yang marginal (ratio 1.0-1.3) dapat
+				-- prioritas tertinggi karena CAS bisa jadi penentu kemenangan.
+				-- Attack ratio >= 1.4 sudah menang tanpa CAS -> prioritas rendah.
+				-- Attack ratio < 0.9 tidak akan menang walau ada CAS -> prioritas rendah.
 				local stackSize = (order.facts and order.facts.stackSize) or 1
 				local ratio = (order.facts and order.facts.ratio) or 0
-				local need = stackSize * (1 - math.min(ratio, 1))
+				local marginalWeight = 1.0
+				if ratio >= 1.4 or ratio < 0.9 then
+					marginalWeight = 0.3
+				elseif ratio >= 1.0 and ratio <= 1.3 then
+					marginalWeight = 2.0
+				end
+				local need = stackSize * marginalWeight
 				local prev = regions[regionName] or 0
 				if need > prev then
 					regions[regionName] = need
@@ -1205,7 +1295,7 @@ Formula.define({
 ---@param defenderStrengths table array of combat.defenderStrength per attacker, including the defender's no-supply factor
 ---@param defenderHealth number
 ---@return table
-local function simulate(attackerHealths, attackerDamages, defenderStrengths, defenderHealth)
+local function simulate(attackerHealths, attackerDamages, defenderStrengths, defenderHealth, defenderHealsPerTick)
 	local margin = defenderHealth - DEFENDER_HEALTH_FLOOR
 	local healths = {}
 	local active = {}
@@ -1227,21 +1317,39 @@ local function simulate(attackerHealths, attackerDamages, defenderStrengths, def
 	local lastExhaustRound = 0
 	local stalled = false
 
-	while #active > 0 do
-		round += 1
+	-- [FIX-HEAL] Defender heal selama fight. Setiap kali tick pass (setiap
+-- tickPeriod/hitInterval round), margin naik sebesar healPerTick.
+-- Kalau healPerTick == 0 (default), perilaku lama.
+local hitInterval = 1.0494
+local tickPeriod = 3.07
+local healPerTick = 0
+local nextHealRound = math.huge
+if defenderHealsPerTick and defenderHealsPerTick > 0 and tickPeriod > 0 then
+    healPerTick = defenderHealsPerTick
+    nextHealRound = math.max(1, math.floor(tickPeriod / hitInterval))
+end
 
-		local count = #active
-		local roundDamage = 0
-		local roundLoss = 0
+while #active > 0 do
+    round += 1
 
-		for _, index in ipairs(active) do
-			roundDamage += attackerDamages[index]
-			roundLoss += defenderStrengths[index]
-		end
+    -- [FIX-HEAL] Tambah heal saat tick boundary
+    if healPerTick > 0 and round >= nextHealRound then
+        margin = margin + healPerTick
+        nextHealRound = nextHealRound + math.max(1, math.floor(tickPeriod / hitInterval))
+    end
 
-		delivered += roundDamage
+    local count = #active
+    local roundDamage = 0
+    local roundLoss = 0
 
-		local breaksNow = breakRound == nil and delivered >= margin
+    for _, index in ipairs(active) do
+        roundDamage += attackerDamages[index]
+        roundLoss += defenderStrengths[index]
+    end
+
+    delivered += roundDamage
+
+    local breaksNow = breakRound == nil and delivered >= margin
 
 		if roundLoss <= 0 then
 			stalled = true
@@ -1343,9 +1451,10 @@ Tracer.instrument("Features.Combat.CombatFormulas", CombatFormulas)
 ---@param defenderStrengths table
 ---@param defenderHealth number
 ---@return table { ratio, breaks, breakRound, healthsAtBreak, tie, rounds, deliveredDamage, defenderMargin, exhaustedRound, finalHealths }
-function CombatFormulas.engagement(attackerHealths, attackerDamages, defenderStrengths, defenderHealth)
+function CombatFormulas.engagement(attackerHealths, attackerDamages, defenderStrengths, defenderHealth, defenderHealsPerTick)
 	-- [FIX-H6] Formula.evaluate akan menjalankan simulate() untuk kedua kalinya; .ratio sudah diisi.
-	return simulate(attackerHealths, attackerDamages, defenderStrengths, defenderHealth)
+	-- [FIX-HEAL] defenderHealsPerTick opsional; default 0 (perilaku lama).
+	return simulate(attackerHealths, attackerDamages, defenderStrengths, defenderHealth, defenderHealsPerTick)
 end
 
 return CombatFormulas
@@ -1410,6 +1519,15 @@ local STATES_THAT_CANNOT_START_AN_ATTACK = { Defending = true, Retreating = true
 
 -- [BUGFIX-C4] Bounded sample window for measured hit intervals.
 local MAX_MEASURED_HIT_INTERVALS = 512
+
+-- [FIX-CAS] Kalau true, CAS multiplier dipakai saat kita menyerang.
+-- Default false karena CAS client mirror belum terverifikasi runtime.
+CombatModel.trustCAS = false
+
+function CombatModel.setTrustCAS(value)
+	CombatModel.trustCAS = (value == true)
+	Logger.info("Features.Combat.CombatModel", "trustCASChanged", { enabled = CombatModel.trustCAS })
+end
 
 -- State.
 CombatModel.measuredHitIntervals = {}
@@ -1517,6 +1635,7 @@ local function countryInfo(context, countryName)
 		noSupplyCombatCoef = Resolver.requireAttribute(army, "noSupplyCombatCoef", "number"),
 		cityDefensesStrengthModifier = Resolver.optionalAttribute(techs, "cityDefensesStrengthModifier", "number", "TroopCommon.lua:515 reads it with default 1") or ABSENT_COEFFICIENT,
 		tileFortDefenseModifier = Resolver.optionalAttribute(techs, "tileFortDefenseModifier", "number", "TroopCommon.lua:412 reads it with default 1") or ABSENT_COEFFICIENT,
+		replenishSpeedModifier = Resolver.optionalAttribute(techs, "replenishSpeedModifier", "number", "Techs.replenishSpeedModifier default 1") or ABSENT_COEFFICIENT,
 		cities = Resolver.requireChild(country, "Cities"),
 		allies = Ownership.diplomacyNames(countryName, "Allies"),
 		values = {},
@@ -1776,13 +1895,26 @@ local function hitNumbers(context, attacker, fromTile, defender, onTile, ourSide
 	end
 
 	local experience = attacker.experience
-	if ourSide ~= "attacker" then
+	if ourSide == "attacker" then
+		-- [FIX-EXP] Atribut experience = floor(E). Expected value = floor(E)+0.5.
+		-- Ini membuat prediksi damage kita sedikit lebih akurat (2% lebih tinggi).
+		experience += 0.5
+	else
+		-- Terhadap kita: pakai upper bound (pessimis).
 		experience += EXPERIENCE_UPPER_BOUND_OFFSET
 	end
 
-	local cas = ABSENT_COEFFICIENT
-	if ourSide ~= "attacker" then
-		cas = casOnCached(context, attackerInfo, onTile)
+			local cas = ABSENT_COEFFICIENT
+	local observedCas = casOnCached(context, attackerInfo, onTile)
+
+	if ourSide == "attacker" then
+		-- Hanya hitung CAS yang sudah benar-benar ada di AirMap.
+		-- CAS yang baru akan di-dispatch oleh AirPlanner tetap tidak diasumsikan.
+		if observedCas > ABSENT_COEFFICIENT then
+			cas = observedCas
+		end
+	elseif ourSide ~= "attacker" then
+		cas = observedCas
 	end
 
 	local damage = Formula.evaluateFast("combat.attackerDamage", {
@@ -1846,7 +1978,23 @@ function CombatModel.engage(context, attackers, defender, defenderTile, ourSide)
 		strengths[index] = strength
 	end
 
-	local result = CombatFormulas.engagement(healths, damages, strengths, defender.health)
+	-- [FIX-HEAL] Baca heal per tick defender.
+-- Kalau defender disupply dan tidak cut, heal = heal.perTick.
+-- Kalau defender cut supply atau noMoney, tidak heal.
+local defenderHeal = 0
+if not (defender.noSupply or defender.noMoney) then
+    local defenderInfo = countryInfo(context, defender.owner)
+    local healInfo = GameModules.get("ArmyCommon").troopNameToInfo[defender.troopName]
+    if healInfo ~= nil and healInfo.replenish ~= nil then
+        local secondsPerDay = GameModules.get("Utils").secondsPerDay
+        local replenishSpeed = Resolver.optionalAttribute(
+            defenderInfo.values and defenderInfo.instance:FindFirstChild("Techs") or nil,
+            "replenishSpeedModifier", "number",
+            "Techs.replenishSpeedModifier default 1") or 1
+        defenderHeal = healInfo.replenish * secondsPerDay * replenishSpeed
+    end
+end
+	local result = CombatFormulas.engagement(healths, damages, strengths, defender.health, defenderHeal)
 	local interval, intervalSource = CombatModel.hitIntervalSeconds()
 
 	-- [SPRINT-3] Break time dikalibrasi oleh bias.
@@ -1855,11 +2003,40 @@ function CombatModel.engage(context, attackers, defender, defenderTile, ourSide)
 	else
 		result.breakSeconds = nil
 	end
-	result.hitIntervalSeconds = interval
+		result.hitIntervalSeconds = interval
 	result.hitIntervalSource = intervalSource
 	result.damages = damages
 	result.strengths = strengths
 	result.attackers = attackers
+
+	local totalDamagePerRound = 0
+	for _, damage in ipairs(damages) do
+		totalDamagePerRound += damage
+	end
+	result.damagePerRound = totalDamagePerRound
+	result.breakSlackRatio = (result.ratio or 0) - 1
+
+	local hpList = result.healthsAtBreak or result.finalHealths or {}
+	local minHP = math.huge
+	local sumHP = 0
+
+	for _, hp in ipairs(hpList) do
+		if type(hp) == "number" then
+			if hp < minHP then minHP = hp end
+			sumHP += hp
+		end
+	end
+
+	if #hpList > 0 and minHP < math.huge then
+		result.minHealthAfter = minHP
+		result.avgHealthAfter = sumHP / #hpList
+	else
+		result.minHealthAfter = nil
+		result.avgHealthAfter = nil
+	end
+
+	result.marginal = (result.ratio or 0) < 1.25
+		or (result.minHealthAfter ~= nil and result.minHealthAfter < 35)
 
 	-- [SPRINT-3] Simpan ke cache.
 	if context.engageCache ~= nil then
@@ -1927,6 +2104,272 @@ function CombatModel.pushHitInterval(seconds)
 end
 
 return CombatModel
+
+]=]
+
+
+MODULE_SOURCES["Features/Combat/ReinforcementPredictor"] = [=[
+--[[
+	Features/Combat/ReinforcementPredictor
+
+	Wave 3 tactical intel: estimate when hostile backup can reach a tile.
+	This does not change combat formulas; it only helps planners avoid attacks that
+	win on paper but lose when a nearby reserve arrives before break time.
+]]
+
+local ReinforcementPredictor = {}
+
+local Logger = require("Utility/Logger")
+local Tracer = require("Utility/Tracer")
+local MapGraph = require("Game/MapGraph")
+local Pathing = require("Features/Movement/Pathing")
+local FrontAnalyzer = require("Features/Front/FrontAnalyzer")
+
+local MAX_UNITS_CHECKED = 14
+local DEFAULT_HORIZON_SECONDS = 12
+local CACHE_PREFIX = "reinforce:"
+
+local function hostileAllowed(hostileCountries, owner)
+	return hostileCountries ~= nil and hostileCountries[owner] == true
+end
+
+local function lowerBoundSeconds(world, unit, tileName)
+	local fromRecord = MapGraph.tiles[unit.tile]
+	local toRecord = MapGraph.tiles[tileName]
+	if fromRecord == nil or toRecord == nil then
+		return math.huge
+	end
+	local speed = Pathing.fastestSpeed(world.paths, unit)
+	if speed <= 0 then return math.huge end
+	return (fromRecord.position - toRecord.position).Magnitude / speed
+end
+
+local function etaFromCurrentPath(world, unit, tileName, horizon)
+	if unit.currentPath == nil or unit.currentPath == "" or unit.currentPath == "[]" then
+		return nil
+	end
+
+	local httpService = game:GetService("HttpService")
+	local ok, decoded = pcall(httpService.JSONDecode, httpService, unit.currentPath)
+	if not ok or type(decoded) ~= "table" then
+		return nil
+	end
+
+	local previous = unit.tile
+	local eta = 0
+	local path = { unit.tile }
+
+	for _, step in ipairs(decoded) do
+		if MapGraph.tiles[previous] == nil or MapGraph.tiles[step] == nil then
+			return nil
+		end
+
+		eta += Pathing.hopSeconds(world.paths, unit, previous, step)
+		if #path >= 2 then eta += Pathing.stepOverheadSeconds() end
+		table.insert(path, step)
+
+		if step == tileName then
+			if eta <= horizon then
+				return eta, path, "currentPath"
+			end
+			return nil
+		end
+
+		previous = step
+		if eta > horizon then return nil end
+	end
+
+	return nil
+end
+
+function ReinforcementPredictor.toTile(world, tileName, hostileCountries, horizonSeconds, excludeUnitId)
+	horizonSeconds = horizonSeconds or DEFAULT_HORIZON_SECONDS
+	world._reinforcementCache = world._reinforcementCache or {}
+	local cacheKey = CACHE_PREFIX .. tostring(tileName) .. "|" .. tostring(horizonSeconds) .. "|" .. tostring(excludeUnitId)
+	local cached = world._reinforcementCache[cacheKey]
+	if cached ~= nil then return cached end
+
+	local candidates = {}
+	for _, unit in ipairs(world.enemyUnits or {}) do
+		if unit.id ~= excludeUnitId
+			and hostileAllowed(hostileCountries, unit.owner)
+			and unit.tile ~= tileName
+			and unit.state ~= "Dead"
+			and unit.state ~= "Retreating" then
+
+			local bound = lowerBoundSeconds(world, unit, tileName)
+			if bound <= horizonSeconds then
+				table.insert(candidates, { unit = unit, bound = bound })
+			end
+		end
+	end
+
+	table.sort(candidates, function(a, b)
+		if a.bound ~= b.bound then return a.bound < b.bound end
+		return a.unit.id < b.unit.id
+	end)
+
+	local arrivals = {}
+	local checked = 0
+
+	for _, candidate in ipairs(candidates) do
+		if checked >= MAX_UNITS_CHECKED then break end
+		checked += 1
+
+		local unit = candidate.unit
+		local eta, path, kind = etaFromCurrentPath(world, unit, tileName, horizonSeconds)
+
+		if eta == nil then
+			local search = Pathing.search(world.paths, unit, { maxSeconds = horizonSeconds })
+			eta = search.times[tileName]
+			if eta ~= nil then
+				path = Pathing.pathTo(search, tileName)
+				kind = "search"
+			end
+		end
+
+		if eta ~= nil then
+			table.insert(arrivals, {
+				unit = unit,
+				unitId = unit.id,
+				owner = unit.owner,
+				eta = eta,
+				path = path,
+				kind = kind,
+			})
+		end
+	end
+
+	table.sort(arrivals, function(a, b)
+		if a.eta ~= b.eta then return a.eta < b.eta end
+		return a.unitId < b.unitId
+	end)
+
+	world._reinforcementCache[cacheKey] = arrivals
+	return arrivals
+end
+
+function ReinforcementPredictor.arrivesBeforeBreak(world, tileName, breakSeconds, hostileCountries, excludeUnitId, margin)
+	if breakSeconds == nil then return nil end
+	margin = margin or 0.9
+	local horizon = math.max(0, breakSeconds * margin)
+	local arrivals = ReinforcementPredictor.toTile(world, tileName, hostileCountries, horizon, excludeUnitId)
+	return arrivals[1], arrivals
+end
+
+function ReinforcementPredictor.summary(arrivals, maxCount)
+	local out = {}
+	for index = 1, math.min(maxCount or 3, #arrivals) do
+		local item = arrivals[index]
+		table.insert(out, {
+			unitId = item.unitId,
+			owner = item.owner,
+			eta = item.eta,
+			kind = item.kind,
+		})
+	end
+	return out
+end
+
+return Tracer.instrument("Features.Combat.ReinforcementPredictor", ReinforcementPredictor)
+
+]=]
+
+
+MODULE_SOURCES["Features/Combat/TimingCoordinator"] = [=[
+--[[
+	Features/Combat/TimingCoordinator
+
+	Wave 4 experimental: align multiple offensive orders so one attack does not
+	resolve far earlier than the companion attack. Disabled by default via setting.
+]]
+
+local TimingCoordinator = {}
+
+local Logger = require("Utility/Logger")
+local Tracer = require("Utility/Tracer")
+local Settings = require("Features/Core/Settings")
+
+local MAX_DELAY_SECONDS = 2.5
+local ALIGN_WINDOW_SECONDS = 1.25
+local MIN_ATTACKS_TO_ALIGN = 2
+
+TimingCoordinator.delayedUntil = {}
+
+local ATTACK_PURPOSE = {
+	capitalStrike = true,
+	kill = true,
+	surroundKill = true,
+	cutOffAttack = true,
+	attack = true,
+	pathClear = true,
+	corridorClear = true,
+	relief = true,
+	hunt = true,
+}
+
+local function enabled()
+	local ok, value = pcall(Settings.get, "combat.timingCoordinator")
+	return ok and value == true
+end
+
+local function orderKey(order)
+	return tostring(order.unitId) .. ":" .. tostring(order.destination) .. ":" .. tostring(order.purpose)
+end
+
+function TimingCoordinator.run(world, plan)
+	if not enabled() then return nil end
+
+	local attacks = {}
+	for _, order in ipairs(plan.orders or {}) do
+		local breakSeconds = order.facts and order.facts.breakSeconds
+		if order.isAttack and ATTACK_PURPOSE[order.purpose] and type(breakSeconds) == "number" then
+			table.insert(attacks, order)
+		end
+	end
+
+	if #attacks < MIN_ATTACKS_TO_ALIGN then return nil end
+
+	local latestBreak = 0
+	for _, order in ipairs(attacks) do
+		if order.facts.breakSeconds > latestBreak then
+			latestBreak = order.facts.breakSeconds
+		end
+	end
+
+	local delayed = 0
+	for _, order in ipairs(attacks) do
+		local gap = latestBreak - order.facts.breakSeconds
+		if gap > ALIGN_WINDOW_SECONDS then
+			local key = orderKey(order)
+			local untilTime = TimingCoordinator.delayedUntil[key]
+			if untilTime == nil or untilTime <= world.serverTime then
+				untilTime = world.serverTime + math.min(gap - ALIGN_WINDOW_SECONDS, MAX_DELAY_SECONDS)
+				TimingCoordinator.delayedUntil[key] = untilTime
+			end
+			order.facts.notBeforeServerTime = untilTime
+			order.facts.timingAlignedToBreak = latestBreak
+			delayed += 1
+		end
+	end
+
+	if delayed > 0 then
+		Logger.info("Features.Combat.TimingCoordinator", "aligned", {
+			orders = #attacks,
+			delayed = delayed,
+			latestBreak = latestBreak,
+		})
+	end
+
+	return { attacks = #attacks, delayed = delayed, latestBreak = latestBreak }
+end
+
+function TimingCoordinator.reset(reason)
+	table.clear(TimingCoordinator.delayedUntil)
+	Logger.info("Features.Combat.TimingCoordinator", "reset", { reason = reason })
+end
+
+return Tracer.instrument("Features.Combat.TimingCoordinator", TimingCoordinator)
 
 ]=]
 
@@ -2470,6 +2913,9 @@ local FrontPlanner = require("Features/Front/FrontPlanner")
 ---@module Features.Orders.OrderExecutor
 local OrderExecutor = require("Features/Orders/OrderExecutor")
 
+---@module Utility.DebugFile
+local DebugFile = require("Utility/DebugFile")
+
 -- Constants.
 local EMPTY_PATH_JSON = "[]"
 -- [BUGFIX-C4] Cap sample windows so a long session does not leak memory.
@@ -2479,13 +2925,13 @@ local MAX_LATENCY_SAMPLES = 256
 Scheduler.hooks = {}
 Scheduler.scheduled = false
 Scheduler.lastCombatCycleClock = 0
-Scheduler.MIN_COMBAT_INTERVAL = 0.15
--- [PERF-SCH-1] Adaptive throttle: interval dasar × multiplier menyesuaikan
--- biaya cycle terakhir. Saat cycle jadi berat (>40ms), kita melambat supaya
--- main thread tidak kehabisan budget render.
+-- [FIX-LAG] Chain one-hop butuh Scheduler yang reaktif. Adaptive throttle
+-- sebelumnya (max 0.3s, headroom 1.0) bikin chain panjang terasa lambat.
+-- Sekarang: max 0.15s, headroom 0.5 -> duty cycle ~66%, responsif.
+Scheduler.MIN_COMBAT_INTERVAL = 0.05
 Scheduler.lastCycleCost = 0
-Scheduler.MAX_ADAPTIVE_INTERVAL = 0.9
-Scheduler.ADAPTIVE_HEADROOM = 1.6
+Scheduler.MAX_ADAPTIVE_INTERVAL = 0.15
+Scheduler.ADAPTIVE_HEADROOM = 0.5
 Scheduler.tickPending = nil
 Scheduler.combatTriggers = {}
 Scheduler.lastStates = {}
@@ -2494,6 +2940,15 @@ Scheduler.lastCycle = nil
 Scheduler.reactionLatencies = {}
 Scheduler.running = false
 Scheduler.context = { capitalTile = nil, enemies = {} }
+-- [HOTFIX-FINISHER] Konstanta ini sempat tidak pernah terdefinisi -> cycle
+-- combat error "attempt to compare nil <= number" di runPending.
+Scheduler.ECONOMY_INTERVAL = 15
+Scheduler.lastEconomyClock = nil
+Scheduler.lastEconomyOk = nil
+Scheduler.lastEconomyError = nil
+Scheduler.lastFrontError = nil
+Scheduler.lastWorldError = nil
+Scheduler.lastSkip = nil
 
 ---True when a land tile is ours or touches ours.
 ---@param tileName string
@@ -2571,20 +3026,53 @@ local function runPending()
 			Scheduler.hooks.onVerdict(verdict)
 		end
 
-		if not verdict.canPlan or not Settings.get("front.enabled") then
+		if not verdict.canPlan then
 			Logger.debug("Features.Core.Scheduler", "cycleSkipped", { kind = kind, reason = verdict.reason })
+			Scheduler.lastSkip = { kind = kind, reason = verdict.reason, at = os.clock(), label = label }
+			-- [HOTFIX-PEACE-WATCHDOG] Skip harus terlihat di file; print/warn tidak
+			-- muncul di executor, jadi dulu "AI diam total" tanpa jejak apa pun.
+			DebugFile.appendLineThrottled("DebugLog",
+				string.format("[CTWDBG Skip] cycle=%s kind=%s reason=%s", label, kind, tostring(verdict.reason)), 3)
 			Formula.flushSuppressed(traceId)
 			return
 		end
 
-		local world = Profiler.run("Cycle_WorldView", WorldView.build, verdict.country, label)
+		-- [HOTFIX-PEACE-WATCHDOG] WorldView.build bisa error (mis. capital hilang,
+		-- diplomacy kosong saat damai). Dulu error itu membatalkan cycle tanpa file.
+		local okWorld, world = pcall(Profiler.run, "Cycle_WorldView", WorldView.build, verdict.country, label)
+		if not okWorld or world == nil then
+			Scheduler.lastWorldError = { label = label, message = tostring(world), at = os.clock() }
+			shared.CTW_WorldError = Scheduler.lastWorldError
+			DebugFile.writeJson("CycleError", {
+				build = shared.CTW_Build, stage = "WorldView.build",
+				label = label, kind = kind, message = tostring(world),
+			})
+			Formula.flushSuppressed(traceId)
+			return
+		end
 		world.tickNumber = (tickInfo ~= nil and tickInfo.tickNumber) or 0
 		world.cycleKind = kind
 		Scheduler.context = { capitalTile = world.capitalTile, enemies = world.enemies }
 		OrderExecutor.pruneCommitments(world)
 
-		local plan, analysis = Profiler.run("Cycle_FrontPlan", FrontPlanner.plan, world, OrderExecutor.blockedUnits(), OrderExecutor.commitments(), kind)
-		local summary = Profiler.run("Cycle_Execute", OrderExecutor.execute, world, plan, verdict.canSend)
+		-- [HOTFIX-PEACE-PIPELINE] Front dan non-front (economy/research/focus/air)
+		-- harus independen. Dulu: front.enabled off ATAU satu error di FrontPlanner
+		-- = seluruh cycle batal, jadi economy/research/government ikut mati --
+		-- paling kelihatan saat damai karena tidak ada yang memaksa cycle ulang.
+		local plan, analysis, summary
+		local frontEnabled = Settings.get("front.enabled")
+		if frontEnabled then
+			local okFront, failureFront = pcall(function()
+				plan, analysis = Profiler.run("Cycle_FrontPlan", FrontPlanner.plan, world, OrderExecutor.blockedUnits(), OrderExecutor.commitments(), kind)
+				summary = Profiler.run("Cycle_Execute", OrderExecutor.execute, world, plan, verdict.canSend)
+			end)
+			if not okFront then
+				shared.CTW_FrontError = { label = label, message = tostring(failureFront), at = os.clock() }
+				Scheduler.lastFrontError = shared.CTW_FrontError
+				warn(string.format("[CTW_WarAI] front pipeline failed (%s): %s", tostring(label), tostring(failureFront)))
+			end
+		end
+		summary = summary or { dryRun = 0, sent = 0, skipped = "front disabled or failed" }
 
 		if #triggers > 0 then
 			local earliest = math.huge
@@ -2608,8 +3096,20 @@ local function runPending()
 			})
 		end
 
-		if kind == "tick" and Scheduler.hooks.onTick ~= nil then
-			Profiler.run("Cycle_TickHooks", Scheduler.hooks.onTick, world, analysis, plan)
+		-- [HOTFIX-PEACE-PIPELINE] Jalankan hook non-front pada tick, ATAU kalau
+		-- sudah lewat ECONOMY_INTERVAL sejak terakhir (dayTick bisa jarang/hilang
+		-- saat damai). Error di sini tidak boleh membunuh cycle berikutnya.
+		local sinceEconomy = os.clock() - (Scheduler.lastEconomyClock or -math.huge)
+		local wantEconomy = (kind == "tick") or sinceEconomy >= (Scheduler.ECONOMY_INTERVAL or 15)
+		if wantEconomy and Scheduler.hooks.onTick ~= nil then
+			Scheduler.lastEconomyClock = os.clock()
+			local okHooks, failureHooks = pcall(Profiler.run, "Cycle_TickHooks", Scheduler.hooks.onTick, world, analysis, plan)
+			Scheduler.lastEconomyOk = okHooks
+			if not okHooks then
+				shared.CTW_EconomyError = { label = label, message = tostring(failureHooks), at = os.clock() }
+				Scheduler.lastEconomyError = shared.CTW_EconomyError
+				warn(string.format("[CTW_WarAI] tick hooks failed (%s): %s", tostring(label), tostring(failureHooks)))
+			end
 		end
 
 		if kind == "tick" then
@@ -2619,13 +3119,21 @@ local function runPending()
 		Scheduler.lastCycle = {
 			kind = kind,
 			label = label,
-			plan = plan:summary(),
+			plan = plan ~= nil and plan:summary() or nil,
 			orders = summary,
 			serverTime = world.serverTime,
+			at = os.clock(),
 		}
 
-		if Scheduler.hooks.onPlanned ~= nil then
-			Scheduler.hooks.onPlanned(world, plan, summary)
+		-- [HOTFIX-PEACE-WATCHDOG] onPlanned membaca plan:summary(); kalau front mati
+		-- plan == nil dan hook ini dulu meledak SETELAH economy jalan.
+		if plan ~= nil and Scheduler.hooks.onPlanned ~= nil then
+			local okPlanned, failurePlanned = pcall(Scheduler.hooks.onPlanned, world, plan, summary)
+			if not okPlanned then
+				shared.CTW_PlannedHookError = tostring(failurePlanned)
+				DebugFile.appendLineThrottled("DebugLog",
+					"[CTWDBG Error] onPlanned: " .. tostring(failurePlanned), 3)
+			end
 		end
 
 		Formula.flushSuppressed(traceId)
@@ -2648,6 +3156,12 @@ local function runPending()
 		}
 		warn(cycleMessage)
 		print(cycleMessage)
+		-- [HOTFIX-PEACE-WATCHDOG] print/warn tidak terlihat di executor -> tulis file.
+		DebugFile.writeJson("CycleError", {
+			build = shared.CTW_Build, stage = "cycle", label = label, kind = kind,
+			message = tostring(failure),
+		})
+		DebugFile.appendLine("DebugLog", "[CTWDBG Error] " .. cycleMessage)
 		Logger.warn("Features.Core.Scheduler", "cycleAborted", { kind = kind, label = label, message = tostring(failure) })
 	end
 end
@@ -2813,6 +3327,26 @@ function Scheduler.refreshContext(countryName)
 	Scheduler.context = {
 		capitalTile = Ownership.capitalTile(countryName),
 		enemies = Ownership.enemiesOf(countryName),
+	}
+end
+
+---[HOTFIX-PEACE-WATCHDOG] Snapshot untuk watchdog file.
+---@return table
+function Scheduler.debugSnapshot()
+	return {
+		cycleCount = Scheduler.cycleCount,
+		lastCycle = Scheduler.lastCycle,
+		lastSkip = Scheduler.lastSkip,
+		lastFrontError = Scheduler.lastFrontError,
+		lastWorldError = Scheduler.lastWorldError,
+		lastEconomyError = Scheduler.lastEconomyError,
+		lastEconomyOk = Scheduler.lastEconomyOk,
+		secondsSinceEconomy = Scheduler.lastEconomyClock and (os.clock() - Scheduler.lastEconomyClock) or nil,
+		secondsSinceCycle = Scheduler.lastCycle and Scheduler.lastCycle.at and (os.clock() - Scheduler.lastCycle.at) or nil,
+		scheduled = Scheduler.scheduled,
+		running = Scheduler.running,
+		pendingTriggers = #Scheduler.combatTriggers,
+		tickPending = Scheduler.tickPending ~= nil,
 	}
 end
 
@@ -3079,10 +3613,18 @@ local SWITCHES = {
 	{ key = "air.build",               tab = "AI", section = "Air",          label = "Build new airfields",         default = false, defaultSource = "opt-in: builds airfields at strategic cities", effect = "Builds airfields at cities without one that are near the front." },
 	{ key = "air.nuke",                tab = "AI", section = "Air",          label = "Nuclear deployment",          default = false, defaultSource = "opt-in: deploys nukes via bombers", effect = "Deploys nuclear weapons via bomber aircraft against high-value targets." },
 
+	-- Combat experimental wave toggles
+	{ key = "combat.timingCoordinator", tab = "AI", section = "Combat", label = "Timing coordinator", default = false, defaultSource = "experimental: user opt-in", effect = "Delays early attacks by a few seconds to synchronize multi-front breaks." },
+	{ key = "combat.operationPlanner", tab = "AI", section = "Combat", label = "Operation scorer", default = false, defaultSource = "experimental: user opt-in", effect = "Scores offensive operations so same-tier decisive attacks execute first." },
+
 	-- Client
 	{ key = "antiIdle.enabled",        tab = "AI", section = "Client",       label = "Prevent idle kick",           default = true, defaultSource = "auto-enabled", effect = "Answers idle notice." },
 	-- [BUGFIX-C2] PlanOverlay reads this. Default off because overlay drawing costs work.
 	{ key = "ui.showPlans",            tab = "AI", section = "Client",       label = "Draw plan overlay",           default = false, defaultSource = "user opt-in",     effect = "Draws the last cycle's plan as bars on the map." },
+
+	-- Combat (model kalkulasi pertempuran)
+	-- [FIX-CAS] Aktifkan setelah CAS benar-benar di-deploy; ada kalibrasi Scorecard.
+	{ key = "combat.trustCAS",         tab = "AI", section = "Combat",      label = "Trust CAS in odds",           default = false, defaultSource = "opt-in: turn on after CAS deployed", effect = "Counts close air support damage when predicting our attacks. More accurate, but only after CAS is really deployed." },
 
 	-- War Advisor (hanya toggle; threshold 65% dan 1.5x di-hardcode di module WarAdvisor)
 	{ key = "warAdvisor.enabled",      tab = "AI", section = "War Advisor", label = "War Advisor", default = true, defaultSource = "auto-enabled", effect = "Recommends neighbours worth justifying war on." },
@@ -3108,7 +3650,7 @@ function SettingsCatalog.defineAll()
 	end
 	-- [FIX-BUILD] Sidik jari build: verifikasi versi yang benar-benar berjalan dengan SATU baris.
 	--   print(shared.CTW_Build, #shared.CTW_SettingsKeys)   -> r4 = 19, build lama = nil
-	shared.CTW_Build = "r6-researchq+"
+	shared.CTW_Build = "r23-kill-the-marked"
 	shared.CTW_SettingsKeys = {}
 	for _, definition in ipairs(Settings.definitions) do
 		table.insert(shared.CTW_SettingsKeys, definition.key)
@@ -3323,6 +3865,8 @@ return Tracer.instrument("Features.Economy.EconomyFormulas", EconomyFormulas)
 ]=]
 
 MODULE_SOURCES["Features/Economy/EconomyPlanner"] = [=[
+---@module Utility.DebugFile
+local DebugFile = require("Utility/DebugFile")
 --[[
 	Features/Economy/EconomyPlanner
 
@@ -3405,6 +3949,7 @@ local function isEssentialItem(itemName)
 end
 
 EconomyPlanner.lastSummary = nil
+EconomyPlanner.lastErrors = nil
 
 local function equipmentDemand(world, healPerTick)
 	local TroopCommon = GameModules.get("TroopCommon")
@@ -3943,49 +4488,87 @@ local function planFactory(country, budget)
 	return { city = best.city.name, price = best.price, paybackTicks = payback, ticksLeft = ticksLeft, bought = true }
 end
 
+-- [HOTFIX-PEACE-ECO] Dulu run() memanggil sub-planner langsung: satu error
+-- (mis. remote research berubah) membatalkan SELURUH sisa pipeline -- production,
+-- training, research, focus, factory, fort mati semua tanpa pesan karena cycle
+-- Scheduler membungkusnya dalam satu pcall dan Logger no-op di executor.
+local function step(summary, errors, name, enabledKey, fn, ...)
+	if enabledKey ~= nil then
+		local okSetting, enabled = pcall(Settings.get, enabledKey)
+		if not okSetting then
+			errors[name] = "setting missing: " .. tostring(enabledKey)
+			return nil
+		end
+		if not enabled then
+			summary[name] = "off"
+			return nil
+		end
+	end
+	local ok, result = pcall(fn, ...)
+	if ok then
+		summary[name] = result
+		return result
+	end
+	errors[name] = tostring(result)
+	return nil
+end
+
 function EconomyPlanner.run(world, analysis)
 	local country = world.meInstance
-	local treasury = CountryState.treasury(country)
+	analysis = analysis or { contact = {}, unsafe = {}, gaps = {}, threats = {}, consequence = {} }
+
+	local summary = {}
+	local errors = {}
+
+	local okTreasury, treasury = pcall(CountryState.treasury, country)
+	if not okTreasury then
+		EconomyPlanner.lastSummary = { errors = { treasury = tostring(treasury) } }
+		EconomyPlanner.lastErrors = EconomyPlanner.lastSummary.errors
+		DebugFile.writeJson("EcoDebug", EconomyPlanner.lastSummary)
+		return EconomyPlanner.lastSummary
+	end
+
 	local budget = { money = treasury.money }
-
-	local summary = { money = treasury.money }
-
-	if Settings.get("economy.enabled") then
-		summary.production = planProduction(world, country, analysis)
-		summary.training = planTraining(world, country, budget)
+	summary.money = treasury.money
+	summary.atWar = next(world.enemies or {}) ~= nil
+	-- [HOTFIX-RESEARCH-SLOT] snapshot toggle supaya "off" tidak disangka bug
+	summary.settings = {}
+	for _, key in ipairs({ "economy.enabled", "research.enabled", "focus.enabled",
+		"factories.enabled", "forts.enabled", "air.enabled", "front.enabled", "ai.sendOrders" }) do
+		local okGet, value = pcall(Settings.get, key)
+		summary.settings[key] = okGet and value or "missing"
 	end
 
-	if Settings.get("research.enabled") then
-		summary.research = ResearchPlanner.run(world, country, budget)
-	end
+	step(summary, errors, "production", "economy.enabled", planProduction, world, country, analysis)
+	step(summary, errors, "training",   "economy.enabled", planTraining, world, country, budget)
+	local research = step(summary, errors, "research", "research.enabled", ResearchPlanner.run, world, country, budget)
+	step(summary, errors, "focus",      "focus.enabled", FocusPlanner.run, world, country)
+	step(summary, errors, "defense",    "economy.enabled", planDefense, world, country, analysis, budget)
 
-	if Settings.get("focus.enabled") then
-		summary.focus = FocusPlanner.run(world, country)
-	end
-
-	if Settings.get("economy.enabled") then
-		summary.defense = planDefense(world, country, analysis, budget)
-	end
-
-	if Settings.get("factories.enabled") then
-		local reservedMoney = (summary.research and summary.research.reservedMoney) or 0
-
+	local okFactory, factoryEnabled = pcall(Settings.get, "factories.enabled")
+	if okFactory and factoryEnabled then
+		local reservedMoney = (type(research) == "table" and research.reservedMoney) or 0
 		if budget.money > reservedMoney then
 			local spendable = { money = budget.money - reservedMoney }
-			summary.factory = planFactory(country, spendable)
+			step(summary, errors, "factory", nil, planFactory, country, spendable)
 			budget.money = spendable.money + reservedMoney
 		end
+	else
+		summary.factory = "off"
 	end
 
 	-- Fort dibeli paling akhir supaya tidak menyerobot anggaran riset/factory.
-	if Settings.get("forts.enabled") then
-		summary.fort = planFort(world, country, analysis, budget)
-	end
+	step(summary, errors, "fort", "forts.enabled", planFort, world, country, analysis, budget)
 
 	summary.moneyLeftInPlan = budget.money
+	summary.errors = next(errors) ~= nil and errors or nil
+	summary.ranAt = os.clock()
 	EconomyPlanner.lastSummary = summary
+	EconomyPlanner.lastErrors = summary.errors
+	DebugFile.writeJson("EcoDebug", summary)
 
 	Logger.info("Features.Economy.EconomyPlanner", "planned", summary)
+	return summary
 end
 
 return Tracer.instrument("Features.Economy.EconomyPlanner", EconomyPlanner)
@@ -4184,9 +4767,9 @@ local BUILTIN_RESEARCH_PRIORITY = {
 	"Infantry Equipment IV",
 	"Mechanization I",
 	"Mechanization II",
-	"Anti Tank I",
-	"Anti Tank II",
-	"Anti Tank III",
+	"Anti-Tank I",
+	"Anti-Tank II",
+	"Anti-Tank III",
 	"Tank Parts I",
 	"Tank Parts II",
 	"Tank Parts III",
@@ -4201,6 +4784,7 @@ local BUILTIN_RESEARCH_PRIORITY = {
 	"Infantry Armor II",
 	"Infantry Armor III",
 	"Infantry Armor IV",
+	"Nuclear Protection",
 	"Infantry Attack Equipment I",
 	"Infantry Attack Equipment II",
 	"Support Equipment I",
@@ -4266,8 +4850,15 @@ end
 
 function ResearchPlanner.run(world, country, budget)
 	local slots = CountryState.researchSlots(country)
+	-- [HOTFIX-RESEARCH-SLOT] Dulu slot dianggap TERPAKAI selama ObjectValue-nya
+	-- punya Value. Padahal game meninggalkan tech yang SUDAH SELESAI di slot
+	-- sampai diganti -> freeSlot selamanya false -> riset tidak pernah jalan
+	-- walau duit menumpuk. Sekarang slot dengan tech progress >= COMPLETE
+	-- (atau tech yang tidak dikenal) dihitung KOSONG.
+	local techs = CountryState.techs(country)
 	local freeSlot = nil
 	local inSlot = {}
+	local slotDebug = {}
 
 	local slotNames = {}
 	for slotName in pairs(slots) do
@@ -4279,19 +4870,26 @@ function ResearchPlanner.run(world, country, budget)
 		local techName = slots[slotName]
 
 		if techName == false then
-			if freeSlot == nil then
-				freeSlot = slotName
-			end
+			slotDebug[slotName] = "empty"
+			if freeSlot == nil then freeSlot = slotName end
 		else
-			inSlot[techName] = true
+			local tech = techs[techName]
+			local progress = tech and tech.progress or nil
+			local finished = (tech == nil) or (progress ~= nil and progress >= COMPLETE)
+			slotDebug[slotName] = string.format("%s progress=%s%s",
+				tostring(techName), tostring(progress), finished and " (done -> free)" or "")
+			if finished then
+				if freeSlot == nil then freeSlot = slotName end
+			else
+				inSlot[techName] = true
+			end
 		end
 	end
 
 	if freeSlot == nil then
-		return { freeSlot = false, reservedMoney = 0 }
+		return { freeSlot = false, slots = slotDebug, reservedMoney = 0 }
 	end
 
-	local techs = CountryState.techs(country)
 	local fielded = fieldedClasses(world, country)
 	local ranked = {}
 
@@ -4347,7 +4945,7 @@ function ResearchPlanner.run(world, country, budget)
 	end)
 
 	if #ranked == 0 then
-		return { freeSlot = freeSlot, chosen = nil, reservedMoney = 0 }
+		return { freeSlot = freeSlot, slots = slotDebug, chosen = nil, reason = "no unlocked candidate", reservedMoney = 0 }
 	end
 
 	Formula.recordChoice("R.nextTech", ranked, "TechCatalog tier, then shortest duration, then price")
@@ -4363,7 +4961,7 @@ function ResearchPlanner.run(world, country, budget)
 			tier = TIER,
 		})
 
-		return { freeSlot = freeSlot, chosen = chosen.id, action = "start", reservedMoney = 0 }
+		return { freeSlot = freeSlot, slots = slotDebug, chosen = chosen.id, action = "start", reservedMoney = 0 }
 	end
 
 	local atWar = next(world.enemies) ~= nil
@@ -4553,7 +5151,9 @@ local SupplyModel = require("Features/Supply/SupplyModel")
 
 -- Constants.
 local TIER = "P"
-local MIN_GUARDS_PER_BORDER = 4
+-- [FIX-HOLD] Turun dari 4 ke 2: 4 guard per border terlalu banyak saat punya
+-- 4-5 border (20 unit diam). 2 sudah cukup untuk deteksi awal.
+local MIN_GUARDS_PER_BORDER = 2
 local CAPITAL_DEFENSE_KEEP = 2
 local CAPITAL_RADIUS_HOPS = 2
 local BORDER_RADIUS_HOPS = 1
@@ -5469,7 +6069,9 @@ local Pathing = require("Features/Movement/Pathing")
 local CombatModel = require("Features/Combat/CombatModel")
 
 -- Constants.
-ConvoyManager.MIN_ESCORT = 2
+-- [FIX-CONVOY] Turunkan MIN_ESCORT dari 2 ke 1: deep push (capital approach)
+-- butuh escorts, tapi 2 terlalu banyak. 1 escort sudah cukup untuk screening.
+ConvoyManager.MIN_ESCORT = 1
 ConvoyManager.MAX_ESCORT = 4
 ConvoyManager.ESCORT_MIN_HEALTH = 55
 ConvoyManager.ESCORT_RADIUS_HOPS = 3
@@ -5566,6 +6168,7 @@ local Ownership = require("Game/Ownership")
 local Arrows = require("Game/Arrows")
 local GameModules = require("Game/GameModules")
 local CombatModel = require("Features/Combat/CombatModel")
+local ReinforcementPredictor = require("Features/Combat/ReinforcementPredictor")
 local Pathing = require("Features/Movement/Pathing")
 local SupplyModel = require("Features/Supply/SupplyModel")
 local FrontAnalyzer = require("Features/Front/FrontAnalyzer")
@@ -5584,6 +6187,8 @@ local TIER_PINCER = "A5"
 local TIER_HUNT = "A6"
 local TIER_CUT = "A3"
 local TIER_CAPTURE = "A4"
+local TIER_DUEL = "A3b"   -- [HOTFIX-DUEL]
+local TIER_FINISH = "A1b" -- [HOTFIX-FINISHER]
 local TIER_REVIEW = "AR"
 local PINCER_MIN_VALUE = 120
 local PINCER_MIN_CUT = 2
@@ -5600,6 +6205,45 @@ local AXIS_COORIDOR_T_MIN = -0.2
 local AXIS_COORIDOR_T_MAX = 1.3
 local OFF_AXIS_STRENGTH_RATIO = 3.0
 local OFF_AXIS_CUT_UNITS_MIN = 3
+
+-- [HOTFIX-BLITZ-MOPUP] Lawan AI saat blitz: ambang off-axis dilonggarkan supaya
+-- AI kita mau mop-up tile/unit AI musuh yang bersebelahan walau bukan poros capital.
+local BLITZ_OFF_AXIS_STRENGTH_RATIO = 1.15
+local BLITZ_MOPUP_MAX_ADJ_ENEMIES = 2
+-- [HOTFIX-DUEL] Gate "musuh punya tetangga -> pasti ada backup" terlalu kaku.
+-- Kalau prediksi tempur kita sudah menang cukup telak, serang saja.
+local REINFORCE_OVERRIDE_RATIO = 1.25
+local REINFORCE_OVERRIDE_RATIO_SAFE = 1.6
+-- Tier A3b duel: stare-down 1 tile, cukup menang prediksi tipis.
+local DUEL_MIN_RATIO = 1.05
+local DUEL_MAX_PER_CYCLE = 6
+-- [HOTFIX-FINISHER] Musuh sekarat harus dihabisi walau attack kita lebih kecil.
+-- Yang menentukan bukan perbandingan attack, tapi apakah HP sisa musuh
+-- (margin = health - 10) bisa kita hapus sebelum unit kita turun ke floor.
+local FINISH_HP_MAX = 45          -- musuh dianggap "sekarat" di bawah ini
+local FINISH_MAX_ROUNDS = 6       -- harus pecah cepat, bukan adu panjang
+local FINISH_MAX_PER_CYCLE = 8
+
+local function blitzMode(world)
+	local mode = world.aggressionMode or "normal"
+	return mode == "blitz" or mode == "aggressive"
+end
+
+local function ownerIsAI(ownerName)
+	if ownerName == nil then return false end
+	local ok, isAI = pcall(Ownership.isAI, ownerName)
+	return ok and isAI == true
+end
+
+-- mop-up aktif kalau blitz/aggressive DAN target milik AI (bukan player)
+local function mopUp(world, ownerName)
+	return blitzMode(world) and ownerIsAI(ownerName)
+end
+
+local function capDebug(world, key, inc)
+	world.captureDebug = world.captureDebug or {}
+	world.captureDebug[key] = (world.captureDebug[key] or 0) + (inc or 1)
+end
 
 -- [FIX-CAP-1] Bobot prioritas musuh. Tujuan perang di game ini adalah CAPITAL, jadi jarak
 -- ke capital musuh harus DOMINAN dan kekuatan hanya penentu kedua.
@@ -5697,7 +6341,11 @@ function AttackPlanner.enemyPriority(world)
 	return priorities
 end
 
-local MIN_ATTACK_HEALTH = 60
+-- [FIX-ZOMBIE] Dead zone 50-59: unit dengan HP 50-59 tidak boleh nyerang (< 60)
+-- tapi juga tidak rest (>= 50). Akibatnya unit stuck diam. Fix: turunkan
+-- threshold attack ke 50, dan naikkan rest ke 60 supaya unit heal sampai 60
+-- lalu nyerang lagi (buffer 10 HP).
+local MIN_ATTACK_HEALTH = 50
 local CRITICAL_HP_FLOOR = 35
 
 local function strikers(world, plan, tileName, targetOwner, mode)
@@ -5714,7 +6362,50 @@ local function strikers(world, plan, tileName, targetOwner, mode)
 	return units
 end
 
+-- [ANTI-SUICIDE] Kalau stack besar (>3) tapi ratio menang cuma sedikit (>1.0, <1.3),
+-- kita berisiko mati sia-sia: menang tipis, tapi kehilangan banyak HP/unit.
+-- Pengecualian: purpose yang wajib jalan (capital, relief, corridor, hunt).
+-- [FIX-PASIF] 1.3 terlalu ketat: attack marginal ratio 1.05-1.25 diblokir.
+-- Turun ke 1.15: AI boleh nyerang dengan menang tipis (masih ada safety
+-- margin > 1.0). MAX_STACK naik ke 4: stack 4 diizinkan tanpa safety gate
+-- (stack kecil biasanya bukan suicide).
+local SAFETY_MIN_RATIO = 1.15
+local SAFETY_MAX_STACK = 4
+local SAFETY_EXEMPT_PURPOSES = {
+	capitalStrike = true, capitalSurround = true, relief = true,
+	corridorClear = true, surroundKill = true, hunt = true, duel = true, finisher = true,
+}
+
 local function launch(plan, stack, targetTile, purpose, tier, reason)
+	local ratio = stack.result.ratio or 0
+	local stackSize = #stack.all
+	-- [FIX-LOSS-B2] Pakai rounds dari simulate (sudah include heal bila ada).
+	-- 3 round @ ~1.05s = 3.15s ~= 1 tick. Fight yang lebih dari 3 round
+	-- akan kena 2+ heal tick -> prediksi terlalu optimis. Blok.
+	local rounds = stack.result.rounds or 0
+	if rounds > 3 and not SAFETY_EXEMPT_PURPOSES[purpose] then
+		Logger.debug("Features.Front.AttackPlanner", "launchTooSlow", {
+			tile = targetTile, purpose = purpose, rounds = rounds,
+		})
+		return false
+	end
+	-- [AGGRESSION-MODE] Safety threshold menyesuaikan mode.
+	--   blitz    : tidak ada safety (1.0)
+	--   aggressive: 1.15 (longgar)
+	--   normal   : 1.3
+	--   defensive: 1.4 (ketat)
+	local mode = plan.world and plan.world.aggressionMode or "normal"
+	local effectiveMinRatio = SAFETY_MIN_RATIO
+	if mode == "blitz" then effectiveMinRatio = 1.0
+	elseif mode == "aggressive" then effectiveMinRatio = 1.15
+	elseif mode == "defensive" then effectiveMinRatio = 1.4 end
+	if ratio < effectiveMinRatio and stackSize > SAFETY_MAX_STACK
+		and not SAFETY_EXEMPT_PURPOSES[purpose] then
+		Logger.debug("Features.Front.AttackPlanner", "suicideBlocked", {
+			tile = targetTile, purpose = purpose, ratio = ratio, stackSize = stackSize, mode = mode,
+		})
+		return false
+	end
 	-- [FIX-C2] satu-satunya plan:assign tanpa guard di pipeline front; cegah entri ganda.
 	local launched = {}
 	for _, entry in ipairs(stack.attackers) do
@@ -5732,7 +6423,15 @@ local function launch(plan, stack, targetTile, purpose, tier, reason)
 			plan:hold(entry.unit, purpose, tier, "already attacking in a winning stack")
 		end
 	end
+	return true
 end
+
+-- [PARTIAL-ENCIRCLE] Tutup minimal 2 exit, bukan semua. Sebab:
+--   - Musuh dengan 1 exit tersisa cenderung "die in place" (retreat butuh 1 tile kosong).
+--   - Menutup semua exit sering gagal (unit tidak sampai tepat waktu) -> surround batal total.
+--   - Tutup 2 exit = musuh sudah terjebak, tapi AI tidak boros unit.
+-- Kalau hanya ada 1 exit, tutup 1 sudah cukup.
+local ENCIRCLE_MIN_CLOSED = 2
 
 local function surround(world, plan, defender, stack, purpose, tier)
 	local exits = FrontAnalyzer.exits(world, plan, defender)
@@ -5741,16 +6440,35 @@ local function surround(world, plan, defender, stack, purpose, tier)
 	for _, entry in ipairs(stack.all) do
 		used[entry.unit.id] = true
 	end
-	if #exits == 0 then return true, { exits = 0 } end
+	if #exits == 0 then return true, { exits = 0, closed = 0 } end
 	if breakSeconds == nil then return false, { reason = "no break time" } end
 	local ourMovement = world.paths.movement[world.me] or Ownership.movementCountries(world.me)
 	world.paths.movement[world.me] = ourMovement
-	local chosen = {}
+
+	-- Klasifikasi exit: layak-tutup vs tidak.
+	local enterable = {}
 	for _, exitName in ipairs(exits) do
 		local owner = world.tileOwner[exitName]
-		if owner == nil or not ourMovement[owner] or not plan:isFreeDestination(exitName) then
-			return false, { reason = "exit not enterable", exit = exitName, owner = owner }
+		if owner ~= nil and ourMovement[owner] and plan:isFreeDestination(exitName) then
+			table.insert(enterable, exitName)
 		end
+	end
+
+	-- [PARTIAL-ENCIRCLE] Threshold menyesuaikan aggression mode:
+	--   blitz    : 1 exit cukup (kita kuat, musuh mati saja)
+	--   defensive: 2 exit (hemat unit, tapi tetap trap)
+	--   lain     : default 2
+	local minClosed = ENCIRCLE_MIN_CLOSED
+	local mode = world.aggressionMode or "normal"
+	if mode == "blitz" then minClosed = 1 end
+	if #enterable < minClosed then
+		return false, { reason = "not enough enterable exits to encircle", enterable = #enterable, minClosed = minClosed }
+	end
+	if #exits <= minClosed then minClosed = #exits end
+
+	local chosen = {}
+	for _, exitName in ipairs(enterable) do
+		if #chosen >= minClosed then break end
 		local best = nil
 		for _, unit in ipairs(Tactics.availableNeighbours(world, plan, exitName)) do
 			if not used[unit.id] and not unit.flagged then
@@ -5762,21 +6480,57 @@ local function surround(world, plan, defender, stack, purpose, tier)
 				end
 			end
 		end
+		-- [WAVE3-RETREAT-TRAP] Kalau tidak ada unit adjacent, coba kirim
+		-- reserve lebih jauh yang ETA-nya masih sebelum break. Ini meniru forced
+		-- retreat trap: landing/exit ditempati tepat sebelum defender kalah.
 		if best == nil then
-			return false, { reason = "no unit reaches the exit before the break", exit = exitName, breakSeconds = breakSeconds }
+			local pool = {}
+			for _, unit in ipairs(plan:availableUnits()) do
+				if not used[unit.id] and not unit.flagged and unit.state ~= "Attacking" then
+					table.insert(pool, unit)
+				end
+			end
+			local arrival = nil
+			if #pool > 0 then
+				arrival = Tactics.earliestArrival(world, plan, pool, exitName, breakSeconds * 0.85)
+			end
+			if arrival ~= nil then
+				local placed = CombatModel.placedOn(arrival.unit, exitName)
+				local threat = CombatModel.threat(world.combat, world, exitName, placed)
+				if not threat.breaks then
+					best = {
+						unit = arrival.unit,
+						hop = arrival.seconds,
+						path = arrival.path,
+						threatRatio = threat.ratio,
+						trap = true,
+					}
+				end
+			end
 		end
-		used[best.unit.id] = true
-		table.insert(chosen, { exit = exitName, choice = best })
+
+		if best ~= nil then
+			used[best.unit.id] = true
+			table.insert(chosen, { exit = exitName, choice = best })
+		end
 	end
+
+	if #chosen < minClosed then
+		return false, { reason = "not enough units reach the exits before the break", chosen = #chosen, minClosed = minClosed, breakSeconds = breakSeconds }
+	end
+
 	for _, item in ipairs(chosen) do
-		plan:assign(item.choice.unit, { item.choice.unit.tile, item.exit }, purpose, tier, "occupy the defender's exit so it dies when beaten", {
+		local path = item.choice.path or { item.choice.unit.tile, item.exit }
+		plan:assign(item.choice.unit, path, purpose, tier,
+			"occupy the defender's exit so it dies when beaten", {
 			defenderTile = defender.tile,
 			hopSeconds = item.choice.hop,
 			breakSeconds = breakSeconds,
 			threatRatio = item.choice.threatRatio,
+			forcedRetreatTrap = item.choice.trap == true,
 		})
 	end
-	return true, { exits = #exits }
+	return true, { exits = #exits, closed = #chosen, minClosed = minClosed }
 end
 
 function AttackPlanner.relieve(world, plan, entry)
@@ -5915,7 +6669,9 @@ function AttackPlanner.corridorSecurity(world, plan)
 	-- 1. Musuh yang bersebelahan dengan tile KITA di poros. Iterasi dibatasi pada
 	--    world.enemyUnits (bukan seluruh tileOwner) supaya tidak menambah scan penuh.
 	for _, enemy in ipairs(world.enemyUnits) do
-		if not NOT_TARGETABLE_STATES[enemy.state] and not enemy.flagged then
+		-- [HOTFIX-KILL-MARKED] enemy.flagged = dieOnNextRetreat: musuh yang MATI kalau mundur.
+		-- Itu target TERBAIK, bukan alasan untuk dilewati. Filter lama membuangnya.
+		if not NOT_TARGETABLE_STATES[enemy.state] then
 			local enemyRecord = MapGraph.tiles[enemy.tile]
 			if enemyRecord ~= nil then
 				for _, neighbourName in ipairs(enemyRecord.landNeighbours) do
@@ -6050,7 +6806,8 @@ function AttackPlanner.capitalSweep(world, plan)
 
 	local cleared = 0
 	for _, target in ipairs(sweepTargets) do
-		if not target.unit.flagged then
+		-- [HOTFIX-KILL-MARKED] musuh bertanda tetap disapu
+		if true then
 			local stack = Tactics.winningStack(world, plan, target.tile,
 				strikers(world, plan, target.tile, target.unit.owner))
 			if stack ~= nil and #stack.attackers > 0 then
@@ -6104,6 +6861,40 @@ function AttackPlanner.approachCapital(world, plan, enemyName, capitalTile, defe
 	local result = nil
 	if #entries > 0 then
 		result = CombatModel.engage(world.combat, entries, defender, capitalTile, "attacker")
+
+		-- [WAVE3-REINFORCE-CAP] Backup tidak hanya adjacent; cari reserve musuh
+		-- yang bisa sampai sebelum capital break.
+		local adjacentReinforceEta = FrontAnalyzer.enemyEntrySeconds(world, capitalTile)
+		local predictedBackup = ReinforcementPredictor.arrivesBeforeBreak(world, capitalTile,
+			result and result.breakSeconds or nil, world.enemies, defender.id, 0.85)
+		local reinforceEta = predictedBackup and predictedBackup.eta or adjacentReinforceEta
+
+		-- [HOTFIX-PASSIVE-AI-CAP] Vs AI, jangan delay capital strike kecuali
+		-- benar-benar marginal. AI jarang melakukan timing rescue sempurna.
+		local enemyIsAI = false
+		local okCapAI, capAI = pcall(Ownership.isAI, enemyName)
+		if okCapAI then enemyIsAI = capAI end
+		local backupWindow = enemyIsAI and 0.60 or 0.85
+		local backupRatioGate = enemyIsAI and 1.25 or 2.0
+
+		if result ~= nil
+			and result.breaks
+			and reinforceEta ~= nil
+			and result.breakSeconds ~= nil
+			and result.breakSeconds > reinforceEta * backupWindow
+			and (result.ratio or 0) < backupRatioGate then
+
+			Logger.debug("Features.Front.AttackPlanner", "capitalStrikeDelayedForBackup", {
+				enemy = enemyName,
+				tile = capitalTile,
+				breakSeconds = result.breakSeconds,
+				reinforceEta = reinforceEta,
+				backupUnit = predictedBackup and predictedBackup.unitId or nil,
+				ratio = result.ratio,
+			})
+
+			result = nil
+		end
 	end
 	local ourMovement = world.paths.movement[world.me] or Ownership.movementCountries(world.me)
 	world.paths.movement[world.me] = ourMovement
@@ -6139,17 +6930,21 @@ function AttackPlanner.approachCapital(world, plan, enemyName, capitalTile, defe
 						step = field.towardSource[step]
 						table.insert(path, step)
 					end
-					table.insert(routes, { unit = unit, path = path, studs = firstDistance })
+					local seconds = Pathing.pathSeconds(world.paths, unit, path)
+					table.insert(routes, { unit = unit, path = path, studs = firstDistance, seconds = seconds })
 				end
 			end
 		end
 		table.sort(routes, function(first, second)
 			local firstHeat = ThreatHeat.at(first.path[#first.path])
 			local secondHeat = ThreatHeat.at(second.path[#second.path])
-			local firstScore = first.studs - firstHeat * 0.1
-			local secondScore = second.studs - secondHeat * 0.1
+			local firstScore = first.seconds - firstHeat * 0.05
+			local secondScore = second.seconds - secondHeat * 0.05
 			if firstScore ~= secondScore then
 				return firstScore < secondScore
+			end
+			if first.studs ~= second.studs then
+				return first.studs < second.studs
 			end
 			return first.unit.id < second.unit.id
 		end)
@@ -6170,8 +6965,15 @@ function AttackPlanner.approachCapital(world, plan, enemyName, capitalTile, defe
 			end
 			return true, nil
 		end
+		-- [MULTI-FRONT] Batasi staging per capital supaya unit tidak habis ke satu target.
+		-- Kalau ada >=2 musuh, cap 6 unit per capital; sisanya untuk front/capital lain.
+		-- Kalau hanya 1 musuh, tidak ada cap (all-in boleh).
+		local enemyCount = 0
+		for _ in pairs(world.enemies) do enemyCount += 1 end
+		local stagingCap = enemyCount >= 2 and 6 or math.huge
 		local taken = {}
 		for _, route in ipairs(routes) do
+			if #planned >= stagingCap then break end
 			local stagingTile = route.path[#route.path]
 			local routeSafe, routeWhy = routeIsSafe(route)
 			if not taken[stagingTile] and #route.path <= Pathing.MAX_PATH_TILES and routeSafe then
@@ -6182,7 +6984,13 @@ function AttackPlanner.approachCapital(world, plan, enemyName, capitalTile, defe
 					})
 				else
 					taken[stagingTile] = true
-					table.insert(planned, { unit = route.unit, path = route.path, staging = stagingTile, studs = route.studs })
+					table.insert(planned, {
+					unit = route.unit,
+					path = route.path,
+					staging = stagingTile,
+					studs = route.studs,
+					seconds = route.seconds,
+				})
 					table.insert(entries, { unit = CombatModel.placedOn(route.unit, stagingTile), fromTile = stagingTile })
 					result = CombatModel.engage(world.combat, entries, defender, capitalTile, "attacker")
 					if result.breaks and not result.tie then break end
@@ -6197,7 +7005,11 @@ function AttackPlanner.approachCapital(world, plan, enemyName, capitalTile, defe
 	if result ~= nil and result.breaks and not result.tie then
 		for _, item in ipairs(planned) do
 			plan:assign(item.unit, item.path, "capitalApproach", TIER_CAPITAL, "stage next to " .. enemyName .. "'s capital", {
-				capitalTile = capitalTile, staging = item.staging, studs = item.studs, stagedRatio = result.ratio,
+				capitalTile = capitalTile,
+				staging = item.staging,
+				studs = item.studs,
+				seconds = item.seconds,
+				stagedRatio = result.ratio,
 			})
 		end
 		for _, entry in ipairs(entries) do
@@ -6225,16 +7037,33 @@ function AttackPlanner.kills(world, plan)
 	end
 	local priorities = AttackPlanner.enemyPriority(world)
 
-	for _, target in ipairs(targets) do
+		for _, target in ipairs(targets) do
 		local onAxis, axisDist = isOnAxis(world, target.enemy.tile)
 		target.onAxis = onAxis
 		target.axisDist = axisDist
+
+		local axisBonus = 0
+		if onAxis then
+			axisBonus = math.max(0, 20 - (axisDist or 0) / 15)
+		end
+
+		local threatDensity = (target.enemy.attack or 1) / math.max(target.enemy.health or 100, 20)
+
+		target.killValue =
+			(target.dies and 100 or 0)
+			+ (target.cut and 60 or 0)
+			+ axisBonus
+			+ threatDensity * 10
 	end
 
 	table.sort(targets, function(first, second)
 		if first.onAxis ~= second.onAxis then return first.onAxis end
 		if first.onAxis and second.onAxis and first.axisDist ~= second.axisDist then
 			return first.axisDist < second.axisDist
+		end
+
+		if first.killValue ~= second.killValue then
+			return first.killValue > second.killValue
 		end
 
 		local firstPrio = priorities[first.enemy.owner] and priorities[first.enemy.owner].score or math.huge
@@ -6248,6 +7077,15 @@ function AttackPlanner.kills(world, plan)
 			return first.dies
 		end
 
+		-- [KILL-THREAT] Prioritaskan musuh paling berbahaya per HP:
+		-- attack tinggi + health rendah = ancaman kill termurah dan paling mematikan.
+		-- Tank/AntiTank elit dibunuh duluan, Infantry lemah belakangan.
+		local firstThreat = (first.enemy.attack or 1) / math.max(first.enemy.health or 100, 20)
+		local secondThreat = (second.enemy.attack or 1) / math.max(second.enemy.health or 100, 20)
+		if firstThreat ~= secondThreat then
+			return firstThreat > secondThreat
+		end
+
 		if first.enemy.health ~= second.enemy.health then
 			return first.enemy.health < second.enemy.health
 		end
@@ -6255,33 +7093,96 @@ function AttackPlanner.kills(world, plan)
 		return first.enemy.id < second.enemy.id
 	end)
 
-	local targeted = {}
+		local targeted = {}
+	local reinforcementBlocked = {}
+
 	for _, target in ipairs(targets) do
 		local enemy = target.enemy
-		local stack = Tactics.winningStack(world, plan, enemy.tile, strikers(world, plan, enemy.tile, enemy.owner))
+		local stack = Tactics.winningStack(world, plan, enemy.tile,
+			strikers(world, plan, enemy.tile, enemy.owner))
+
 		if stack ~= nil and #stack.attackers > 0 then
-			local purpose = "kill"
-			if not target.dies then purpose = "cutOffAttack" end
-			launch(plan, stack, enemy.tile, purpose, TIER_KILL, target.why)
-			targeted[enemy.id] = true
+			-- [WAVE3-REINFORCE-KILL] Prediksi backup musuh sebelum break, bukan
+			-- sekadar adjacent unit. Ini menghindari target yang sengaja dijadikan bait.
+			local adjEnemies = FrontAnalyzer.adjacentEnemyUnits(world, enemy.tile)
+			local breakSeconds = stack.result.breakSeconds or math.huge
+			local hitInterval = stack.result.hitIntervalSeconds or 1.05
+			local backup, backupList = ReinforcementPredictor.arrivesBeforeBreak(world, enemy.tile,
+				stack.result.breakSeconds, world.enemies, enemy.id, 0.9)
+
+			-- [HOTFIX-PASSIVE-AI-KILL] Jangan terlalu takut backup saat lawan AI.
+			-- Wave3 reinforcement gate bagus vs player bait, tapi vs AI cluster kecil
+			-- membuat semua target diblok dan front jadi pasif.
+			local targetIsAI = false
+			local okAI, isAI = pcall(Ownership.isAI, enemy.owner)
+			if okAI then targetIsAI = isAI end
+			local backupTooFast = backup ~= nil
+				and stack.result.breakSeconds ~= nil
+				and backup.eta <= stack.result.breakSeconds * 0.60
+
+			local riskyReinforcement = backup ~= nil
+				and not target.dies
+				and breakSeconds > hitInterval * 2
+				and (
+					(not targetIsAI and (stack.result.ratio or 0) < 2.0)
+					or (targetIsAI and backupTooFast and (stack.result.ratio or 0) < 1.25)
+				)
+
+			if riskyReinforcement then
+				reinforcementBlocked[enemy.id] = true
+				Logger.debug("Features.Front.AttackPlanner", "killSkippedReinforcement", {
+					tile = enemy.tile,
+					adjacentEnemies = #adjEnemies,
+					backup = backup and { unitId = backup.unitId, eta = backup.eta, owner = backup.owner } or nil,
+					backupCount = backupList and #backupList or 0,
+					ratio = stack.result.ratio,
+					breakSeconds = stack.result.breakSeconds,
+					reason = "backup likely and kill is not fast/lethal enough",
+				})
+			else
+				local purpose = "kill"
+				if not target.dies then purpose = "cutOffAttack" end
+				if launch(plan, stack, enemy.tile, purpose, TIER_KILL, target.why) then
+					targeted[enemy.id] = true
+				end
+			end
 		end
 	end
 	for _, enemy in ipairs(world.enemyUnits) do
-		if not targeted[enemy.id] and not NOT_TARGETABLE_STATES[enemy.state] and not enemy.flagged then
+		if not targeted[enemy.id]
+		and not reinforcementBlocked[enemy.id]
+		and not NOT_TARGETABLE_STATES[enemy.state] then
+			-- [HOTFIX-KILL-MARKED] enemy.flagged tidak lagi dibuang di sini.
 			local strikeUnits = strikers(world, plan, enemy.tile, enemy.owner)
+			if #strikeUnits == 0 then capDebug(world, "noStrikers") end
 			if #strikeUnits > 0 then
 				local stack = Tactics.winningStack(world, plan, enemy.tile, strikeUnits)
+				if stack == nil or #stack.attackers == 0 then capDebug(world, "noStack") end
 				if stack ~= nil and #stack.attackers > 0 then
+					-- [FIX-KILLS] Coba surround dulu. Kalau surround gagal,
+					-- JANGAN skip — tetap launch attack biasa (musuh akan
+					-- retreat kalau kalah, tapi setidaknya didorong keluar).
 					local exits = FrontAnalyzer.exits(world, plan, enemy)
+					local covered = false
+					local facts = { exits = #exits }
 					if #exits > 0 then
-						local covered, facts = surround(world, plan, enemy, stack, "surround", TIER_KILL)
-						if covered then
-							launch(plan, stack, enemy.tile, "surroundKill", TIER_KILL, "exits occupied: the beaten defender dies")
+						covered, facts = surround(world, plan, enemy, stack, "surround", TIER_KILL)
+					end
+					if covered then
+						-- [WAVE1-KILL-LAUNCH-GUARD] Jangan tandai target sebagai handled
+						-- kalau launch() menolak attack karena safety gate/too-slow.
+						if launch(plan, stack, enemy.tile, "surroundKill", TIER_KILL, "exits occupied: the beaten defender dies") then
 							targeted[enemy.id] = true
 							Logger.info("Features.Front.AttackPlanner", "surroundKill", {
 								tile = enemy.tile, troop = enemy.troopName, ratio = stack.result.ratio,
 								breakSeconds = stack.result.breakSeconds, exits = facts.exits,
 							})
+						end
+					else
+						-- Fallback: attack biasa (musuh retreat, kita ambil tile)
+						if launch(plan, stack, enemy.tile, "cutOffAttack", TIER_KILL,
+							"force enemy to retreat (surround failed)") then
+							targeted[enemy.id] = true
 						end
 					end
 				end
@@ -6435,7 +7336,10 @@ end
 --
 -- Cap MAX_HUNTS_PER_CYCLE untuk menjaga komputasi. Sisanya besok lagi.
 -- ============================================================================
-local MAX_HUNTS_PER_CYCLE = 3
+-- [FIX-HUNT] Naikkan cap hunt dari 3 ke 5: AI lebih agresif habisi musuh
+-- off-axis. Prefilter 14→20: lebih banyak kandidat dievaluasi.
+local MAX_HUNTS_PER_CYCLE = 5
+local HUNT_MAX_STACK_PREFILTER = 20
 local HUNT_AVG_EDGE_STUDS = 15
 
 function AttackPlanner.hunt(world, plan, opts)
@@ -6477,7 +7381,6 @@ function AttackPlanner.hunt(world, plan, opts)
 		if not alreadyTargeted[enemy.tile]
 			and enemy.state ~= "Retreating"
 			and enemy.state ~= "Dead"
-			and not enemy.flagged
 		then
 			local adjacent = FrontAnalyzer.adjacentEnemyUnits(world, enemy.tile)
 			if #adjacent < 3 then
@@ -6522,7 +7425,7 @@ function AttackPlanner.hunt(world, plan, opts)
 
 			-- Cap kandidat untuk winningStack (limit komputasi).
 			local candidateUnits = {}
-			local cap = math.min(#closeCandidates, MAX_STACK_PREFILTER)
+			local cap = math.min(#closeCandidates, HUNT_MAX_STACK_PREFILTER)
 			for i = 1, cap do
 				table.insert(candidateUnits, closeCandidates[i].unit)
 			end
@@ -6588,6 +7491,94 @@ function AttackPlanner.hunt(world, plan, opts)
 	return { hunted = hunted, targets = #targets, candidates = #ourCandidates }
 end
 
+-- [RAID] Kirim 1-2 unit cepat ke supply source musuh di belakang.
+-- Gate: kita unggul (powerRatio >= 1.5) dan target >= 200 studs dari front.
+-- Tujuan: potong supply musuh sehingga unit front mereka kelaparan.
+local RAID_MIN_DISTANCE_STUDS = 200
+local RAID_MAX_RAIDERS = 2
+local RAID_MIN_SPEED = 1.0
+local RAID_MIN_HEALTH = 75
+local RAID_MIN_POWER_RATIO = 1.5
+
+function AttackPlanner.raids(world, plan)
+	if world.cycleKind ~= "tick" then return end
+	if next(world.enemies) == nil then return end
+	if (world.aggressionRatio or 0) < RAID_MIN_POWER_RATIO then return end
+
+	-- Kandidat: unit cepat, sehat, Idle.
+	local raiders = {}
+	for _, unit in ipairs(plan:availableUnits()) do
+		if not unit.flagged
+			and unit.state == "Idle"
+			and (unit.speed or 0) >= RAID_MIN_SPEED
+			and (unit.health or 0) >= RAID_MIN_HEALTH
+			and SupplyModel.isSupplied(world, unit.tile)
+		then
+			table.insert(raiders, unit)
+		end
+	end
+	if #raiders < RAID_MAX_RAIDERS then return end
+	table.sort(raiders, function(a, b)
+		local aScore = (a.speed or 0) * (a.attack or 1)
+		local bScore = (b.speed or 0) * (b.attack or 1)
+		if aScore ~= bScore then return aScore > bScore end
+		return a.id < b.id
+	end)
+
+	-- Cari supply source musuh yang jauh dari front kita (target belakang).
+	local best = nil
+	local bestScore = 0
+	for enemyName in pairs(world.enemies) do
+		local sources = SupplyModel.sourcesOf(world, enemyName)
+		for _, src in ipairs(sources) do
+			if world.tileOwner[src] == enemyName then
+				local srcRecord = MapGraph.tiles[src]
+				if srcRecord ~= nil then
+					local nearestOurUnit = math.huge
+					for _, u in ipairs(world.ourUnits) do
+						local uRecord = MapGraph.tiles[u.tile]
+						if uRecord ~= nil then
+							local d = (uRecord.position - srcRecord.position).Magnitude
+							if d < nearestOurUnit then nearestOurUnit = d end
+						end
+					end
+					local score = math.min(nearestOurUnit / 100, 20)
+					if score > bestScore then
+						bestScore = score
+						best = { tile = src, enemy = enemyName, distance = nearestOurUnit }
+					end
+				end
+			end
+		end
+	end
+	if best == nil then return end
+	if best.distance < RAID_MIN_DISTANCE_STUDS then return end
+
+	-- Assign raiders.
+	local sent = 0
+	for _, raider in ipairs(raiders) do
+		if sent >= RAID_MAX_RAIDERS then break end
+		if plan:isAvailable(raider) then
+			local result = Tactics.search(world, plan, raider, nil)
+			local seconds = result.times[best.tile]
+			if seconds ~= nil then
+				local path = Pathing.pathTo(result, best.tile)
+				if path ~= nil and #path >= 2 then
+					plan:assign(raider, path, "raid", "A2b",
+						string.format("raid %s supply (%.0f studs)", best.enemy, best.distance),
+						{ target = best.tile, enemy = best.enemy, seconds = seconds })
+					sent += 1
+				end
+			end
+		end
+	end
+	if sent > 0 then
+		Logger.info("Features.Front.AttackPlanner", "raidLaunched", {
+			target = best.tile, enemy = best.enemy, raiders = sent, distance = best.distance,
+		})
+	end
+end
+
 local function ownNeighbourCount(world, plan, tileName)
 	local count = 0
 	for _, neighbourName in ipairs(MapGraph.tiles[tileName].landNeighbours) do
@@ -6599,6 +7590,17 @@ local function ownNeighbourCount(world, plan, tileName)
 end
 
 function AttackPlanner.captures(world, plan)
+	-- [HOTFIX-BLITZ-MOPUP] reset telemetry alasan skip tiap siklus
+	world.captureDebug = {
+		walkInCandidates = 0, walkInSkippedStrategic = 0, walkInSkippedBroad = 0,
+		walkInSkippedThreat = 0, walkInSkippedOriginExposed = 0, walkInAssigned = 0,
+		attackCandidates = 0, captureSkippedReinforcement = 0, offAxisSkipped = 0,
+		attackUnsafeAfter = 0, noStrikers = 0, noStack = 0, attackLaunched = 0,
+		mopUpApplied = 0, offAxisGated = 0,
+		-- [HOTFIX-DUEL]
+		mopEligible = 0, reinforceOverride = 0, launchRejected = 0,
+		duelCandidates = 0, duelLaunched = 0, duelNoStack = 0, duelLowRatio = 0,
+	}
 	local walkIns = {}
 	for _, unit in ipairs(plan:availableUnits()) do
 		if not unit.flagged and unit.state ~= "Attacking" then
@@ -6620,6 +7622,13 @@ function AttackPlanner.captures(world, plan)
 						end
 					end
 					local strategic = onAxis or isCity or becomesSource or #cut >= OFF_AXIS_CUT_UNITS_MIN
+					-- [HOTFIX-BLITZ-MOPUP] tile kosong milik AI musuh selalu layak diambil saat blitz
+					if not strategic and mopUp(world, owner) then
+						strategic = true
+						capDebug(world, "mopUpApplied")
+					end
+					capDebug(world, "walkInCandidates")
+					if not strategic then capDebug(world, "walkInSkippedStrategic") end
 					if strategic then
 						table.insert(walkIns, {
 							unit = unit, tile = neighbourName, cutUnits = #cut, isCity = isCity,
@@ -6656,7 +7665,14 @@ function AttackPlanner.captures(world, plan)
 				local folder = cities and cities:FindFirstChild(cityFolder.name)
 				becomesSource = folder ~= nil and folder:GetAttribute("isPort") == true
 			end
-			if not threat.breaks and not originExposed and (broad or becomesSource) then
+			-- [HOTFIX-BLITZ-MOPUP] syarat broad-front dilepas untuk tile AI saat blitz
+			local mop = mopUp(world, world.tileOwner[candidate.tile])
+			local frontOk = broad or becomesSource or mop
+			if threat.breaks then capDebug(world, "walkInSkippedThreat")
+			elseif originExposed and not mop then capDebug(world, "walkInSkippedOriginExposed")
+			elseif not frontOk then capDebug(world, "walkInSkippedBroad") end
+			if not threat.breaks and (not originExposed or mop) and frontOk then
+				capDebug(world, "walkInAssigned")
 				local tier = TIER_CAPTURE
 				local purpose = "walkIn"
 				if candidate.cutUnits > 0 then tier = TIER_CUT; purpose = "cutWalkIn" end
@@ -6684,17 +7700,45 @@ function AttackPlanner.captures(world, plan)
 		for _, nbr in ipairs(MapGraph.tiles[enemy.tile].landNeighbours) do
 			if world.tileOwner[nbr] == world.me then adjacentToUs = true; break end
 		end
-		local offAxisAllowed = defendingUs or #cut >= OFF_AXIS_CUT_UNITS_MIN or adjacentToUs
+		local mop = mopUp(world, enemy.owner)
+		-- [HOTFIX-BLITZ-MOPUP] unit AI musuh boleh dihajar off-axis saat blitz
+		local offAxisAllowed = defendingUs or #cut >= OFF_AXIS_CUT_UNITS_MIN or adjacentToUs or mop
+		capDebug(world, "attackCandidates")
+		if mop then capDebug(world, "mopEligible") end
+		if not (onAxis or offAxisAllowed) then capDebug(world, "offAxisGated") end
 
 		if onAxis or offAxisAllowed then
+			-- [FIX-LOSS-D] Sama seperti kills: kalau target punya musuh tetangga,
+			-- backup hampir pasti datang. Skip kecuali purpose defensif (defendingUs).
+			local adjEnemies = FrontAnalyzer.adjacentEnemyUnits(world, enemy.tile)
+			local reinforceLimit = mop and BLITZ_MOPUP_MAX_ADJ_ENEMIES or 1
+			-- [HOTFIX-DUEL] jangan skip di sini; tandai saja, keputusan final
+			-- diambil setelah winningStack tahu rasio sebenarnya.
+			local reinforceRisk = (#adjEnemies >= reinforceLimit) and not defendingUs
+			if false then
 			local strikeUnits = strikers(world, plan, enemy.tile, enemy.owner)
 			if #strikeUnits > 0 then
 				local stack = Tactics.winningStack(world, plan, enemy.tile, strikeUnits)
 				if stack ~= nil and #stack.attackers > 0 then
 					local ratio = stack.result.ratio or 0
-					if not onAxis and ratio < OFF_AXIS_STRENGTH_RATIO and not defendingUs then
+					local ratioGate = mop and BLITZ_OFF_AXIS_STRENGTH_RATIO or OFF_AXIS_STRENGTH_RATIO
+					-- [HOTFIX-DUEL] evaluasi risiko reinforcement pakai rasio nyata
+					local overrideNeeded = mop and REINFORCE_OVERRIDE_RATIO or REINFORCE_OVERRIDE_RATIO_SAFE
+					if reinforceRisk and ratio < overrideNeeded then
+						capDebug(world, "captureSkippedReinforcement")
+						Logger.debug("Features.Front.AttackPlanner", "captureSkippedReinforcement", {
+							tile = enemy.tile, adjacentEnemies = #adjEnemies,
+							ratio = ratio, needed = overrideNeeded,
+						})
+					elseif reinforceRisk then
+						capDebug(world, "reinforceOverride")
+					end
+					if reinforceRisk and ratio < overrideNeeded then
+						-- skip: backup musuh lebih kuat dari margin kita
+					elseif not onAxis and ratio < ratioGate and not defendingUs then
+						capDebug(world, "offAxisSkipped")
 						Logger.debug("Features.Front.AttackPlanner", "offAxisSkipped", {
-							tile = enemy.tile, ratio = ratio,
+							tile = enemy.tile, ratio = ratio, gate = ratioGate,
 							reason = "off-axis target below strength threshold",
 						})
 					else
@@ -6706,16 +7750,185 @@ function AttackPlanner.captures(world, plan)
 							table.insert(safetyFacts, facts)
 							if not safe then allSafe = false end
 						end
+						-- [HOTFIX-BLITZ-MOPUP] blitz vs AI: menang telak boleh tetap jalan
+						if not allSafe and mop and (stack.result.ratio or 0) >= 1.5 then
+							allSafe = true
+							capDebug(world, "mopUpApplied")
+						end
 						if allSafe then
+							capDebug(world, "attackLaunched")
 							local reason = onAxis
 								and "winning attack on-axis"
 								or (defendingUs and "counter-attack (defender attacked us)"
 									or "off-axis but cuts supply")
-							launch(plan, stack, enemy.tile, "attack", TIER_CAPTURE, reason)
+							if launch(plan, stack, enemy.tile, "attack", TIER_CAPTURE, reason) == false then
+								capDebug(world, "launchRejected")
+							end
 						else
+							capDebug(world, "attackUnsafeAfter")
 							Logger.debug("Features.Front.AttackPlanner", "attackUnsafeAfter", { tile = enemy.tile, ratio = stack.result.ratio, safety = safetyFacts })
 						end
 					end
+				end
+			end
+			end
+		end
+	end
+end
+
+-- ============================================================================
+-- [HOTFIX-FINISHER] Tier A1b: eksekusi musuh sekarat.
+-- Keluhan: musuh tinggal setetes darah dianggurkan karena attack unit kita
+-- lebih kecil dari attack musuh. Padahal yang menentukan menang/kalah adalah
+-- berapa damage yang perlu dikirim (margin = HP musuh - 10) versus berapa lama
+-- unit kita bertahan. Musuh 15 HP cuma butuh 5 damage: unit lemah pun cukup.
+-- Tier ini jalan SEBELUM kills/captures/hunt supaya unit tidak keburu dipakai.
+-- ============================================================================
+function AttackPlanner.finishers(world, plan)
+	if #world.enemyUnits == 0 then return end
+	world.captureDebug = world.captureDebug or {}
+	local debugTable = world.captureDebug
+	debugTable.finishCandidates = debugTable.finishCandidates or 0
+	debugTable.finishLaunched = debugTable.finishLaunched or 0
+	debugTable.finishNoStrikers = debugTable.finishNoStrikers or 0
+	debugTable.finishNoStack = debugTable.finishNoStack or 0
+	debugTable.finishTooSlow = debugTable.finishTooSlow or 0
+
+	local targeted = {}
+	for _, order in ipairs(plan.orders) do
+		if order.isAttack then targeted[order.destination] = true end
+	end
+
+	local wounded = {}
+	for _, enemy in ipairs(world.enemyUnits) do
+		-- [HOTFIX-KILL-MARKED] Musuh bertanda (dieOnNextRetreat) SELALU masuk
+		-- daftar eksekusi berapa pun HP-nya: kalah = mati, mundur = mati.
+		local marked = enemy.flagged == true or enemy.liveFlag == true
+		if not targeted[enemy.tile]
+			and not NOT_TARGETABLE_STATES[enemy.state]
+			and (marked or (enemy.health or 100) <= FINISH_HP_MAX)
+		then
+			enemy._marked = marked
+			table.insert(wounded, enemy)
+			if marked then
+				debugTable.finishMarked = (debugTable.finishMarked or 0) + 1
+			end
+		end
+	end
+	if #wounded == 0 then return end
+
+	-- Paling sekarat duluan: paling murah dihabisi, paling cepat hilang dari peta.
+	table.sort(wounded, function(first, second)
+		-- [HOTFIX-KILL-MARKED] bertanda duluan, baru yang paling sekarat
+		if first._marked ~= second._marked then return first._marked == true end
+		if first.health ~= second.health then return first.health < second.health end
+		return first.id < second.id
+	end)
+
+	local launchedCount = 0
+	for _, enemy in ipairs(wounded) do
+		if launchedCount >= FINISH_MAX_PER_CYCLE then break end
+		debugTable.finishCandidates += 1
+		-- mode "critical": unit kita yang ikut terluka (HP >= 35) tetap boleh ikut,
+		-- karena yang dieksekusi memang target yang nyaris mati.
+		local strikeUnits = strikers(world, plan, enemy.tile, enemy.owner, "critical")
+		if #strikeUnits == 0 then
+			debugTable.finishNoStrikers += 1
+		else
+			local stack, facts = Tactics.winningStack(world, plan, enemy.tile, strikeUnits, "finisher")
+			if stack == nil or #stack.attackers == 0 then
+				debugTable.finishNoStack += 1
+				if type(facts) == "table" then
+					debugTable.finishLastFacts = facts
+				end
+			elseif (stack.result.rounds or 0) > FINISH_MAX_ROUNDS and not stack.result.breaks then
+				debugTable.finishTooSlow += 1
+			else
+				local reason = string.format("finisher: enemy at %d HP (margin %s), predicted break",
+					math.floor(enemy.health or 0), tostring(stack.result.defenderMargin))
+				if launch(plan, stack, enemy.tile, "finisher", TIER_FINISH, reason) then
+					launchedCount += 1
+					debugTable.finishLaunched += 1
+				else
+					capDebug(world, "launchRejected")
+				end
+			end
+		end
+	end
+end
+
+-- ============================================================================
+-- [HOTFIX-DUEL] Tier A3b: stare-down breaker.
+-- Kasus: unit kita dan unit musuh bersebelahan 1 tile, kita lebih kuat, tapi
+-- semua gate (axis / reinforcement / safeAfterFight) menolak -> dua-duanya diam.
+-- Di sini: cukup winningStack memprediksi menang (ratio >= DUEL_MIN_RATIO),
+-- tanpa syarat axis dan tanpa safeAfterFight. Musuh yang sudah jadi target
+-- tier lain dilewati.
+-- ============================================================================
+function AttackPlanner.duels(world, plan)
+	if #world.enemyUnits == 0 then return end
+	local targeted = {}
+	for _, order in ipairs(plan.orders) do
+		if order.isAttack then targeted[order.destination] = true end
+	end
+
+	local launchedCount = 0
+	local candidates = {}
+	for _, enemy in ipairs(world.enemyUnits) do
+		if not targeted[enemy.tile]
+			and not NOT_TARGETABLE_STATES[enemy.state]
+		then
+			-- [HOTFIX-KILL-MARKED] musuh bertanda ikut dilayani di sini juga
+			-- harus benar-benar bersebelahan dengan unit kita yang nganggur
+			local hasNeighbour = false
+			for _, nbr in ipairs(MapGraph.tiles[enemy.tile].landNeighbours) do
+				local ours = world.unitsByTile[nbr]
+				if ours ~= nil and ours.owner == world.me and plan:isAvailable(ours)
+					and ours.state ~= "Attacking" and not ours.flagged then
+					hasNeighbour = true
+					break
+				end
+			end
+			if hasNeighbour then table.insert(candidates, enemy) end
+		end
+	end
+	table.sort(candidates, function(first, second)
+		if first.health ~= second.health then return first.health < second.health end
+		return first.id < second.id
+	end)
+
+	for _, enemy in ipairs(candidates) do
+		if launchedCount >= DUEL_MAX_PER_CYCLE then break end
+		capDebug(world, "duelCandidates")
+		local strikeUnits = strikers(world, plan, enemy.tile, enemy.owner)
+		if #strikeUnits == 0 then
+			capDebug(world, "noStrikers")
+		else
+			local stack, facts = Tactics.winningStack(world, plan, enemy.tile, strikeUnits, "duel")
+			if stack == nil or #stack.attackers == 0 then
+				capDebug(world, "duelNoStack")
+				-- [HOTFIX-DUEL-RATIO] simpan rasio terbaik yang gagal, biar ketahuan
+				-- apakah kita memang kalah hitungan atau cuma kena buffer.
+				if type(facts) == "table" then
+					world.captureDebug = world.captureDebug or {}
+					local best = facts.bestRatio or 0
+					if best > (world.captureDebug.duelBestRatio or 0) then
+						world.captureDebug.duelBestRatio = best
+					end
+					world.captureDebug.duelLastFacts = facts
+				end
+			else
+				local ratio = stack.result.ratio or 0
+				if ratio < DUEL_MIN_RATIO then
+					capDebug(world, "duelLowRatio")
+					Logger.debug("Features.Front.AttackPlanner", "duelLowRatio", {
+						tile = enemy.tile, ratio = ratio,
+					})
+				elseif launch(plan, stack, enemy.tile, "duel", TIER_DUEL, "adjacent stare-down, predicted win") then
+					launchedCount += 1
+					capDebug(world, "duelLaunched")
+				else
+					capDebug(world, "launchRejected")
 				end
 			end
 		end
@@ -6763,6 +7976,11 @@ function AttackPlanner.reviewOngoing(world, plan)
 				avgHealthAfter = avgHealthAfter / #hpList
 				if avgHealthAfter < 30 then losing = true end
 			end
+			-- [FIX-LOSS-C] Halt juga kalau ratio sudah turun < 1.15 (marginal).
+			-- Sebelumnya hanya avg HP yang dicek; ratio bisa 1.05 tapi HP rata-rata masih 45.
+			if not losing and (result.ratio or 0) < 1.15 then
+				losing = true
+			end
 				for _, entry in ipairs(entries) do
 					if entry.unit.owner == world.me and plan:isUnassigned(entry.unit) then
 						if losing then
@@ -6800,6 +8018,7 @@ local DefensePlanner = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
 local MapGraph = require("Game/MapGraph")
+local ThreatHeat = require("Features/Front/ThreatHeat")
 local Tick = require("Game/Tick")
 local CombatModel = require("Features/Combat/CombatModel")
 local Pathing = require("Features/Movement/Pathing")
@@ -6807,7 +8026,6 @@ local SupplyModel = require("Features/Supply/SupplyModel")
 local FrontAnalyzer = require("Features/Front/FrontAnalyzer")
 local Tactics = require("Features/Front/Tactics")
 local WorldView = require("Features/Front/WorldView")
-local ThreatHeat = require("Features/Front/ThreatHeat")
 
 local TIER_CAPITAL = "T0"
 local TIER_UNSAFE = "T1"
@@ -6818,6 +8036,25 @@ local STATES_THAT_CANNOT_MOVE = { Defending = true, Retreating = true, Dead = tr
 
 DefensePlanner.trappedReported = {}
 DefensePlanner.unguardedReported = false
+
+-- [WAVE3-THREAT-FIRST] Expected-loss score for unsafe tiles.
+local CONSEQUENCE_WEIGHT = {
+	[0] = 10000, -- capital
+	[1] = 6000,  -- capital neighbour
+	[2] = 3200,  -- city
+	[3] = 2600,  -- supply
+	[4] = 800,   -- other
+}
+
+local function unsafeScore(entry)
+	local base = CONSEQUENCE_WEIGHT[entry.consequence] or 500
+	local breakSeconds = entry.threat and entry.threat.breakSeconds or nil
+	local urgency = breakSeconds and (1200 / math.max(0.5, breakSeconds)) or 0
+	local ratio = entry.threat and entry.threat.ratio or 0
+	local cut = (entry.cutUnits or 0) * 450
+	local flagged = entry.flagged and 300 or 0
+	return base + urgency + ratio * 250 + cut + flagged
+end
 
 local function enemyNearZone(world, tileName)
 	if #FrontAnalyzer.adjacentEnemyUnits(world, tileName) > 0 then return true end
@@ -6848,8 +8085,12 @@ end
 --   * Kalau sedang Moving -> halt di tempat.
 --   * Kalau cut off supply -> bebas cari supply (termasuk rute berbahaya).
 -- =====================================================================
-local REST_HEALTH_THRESHOLD = 80
-local REST_ATTACK_RATIO_MIN = 1.3
+-- [FIX-ZOMBIE] Rest threshold = 60 (di atas MIN_ATTACK_HEALTH = 50) supaya
+-- unit heal sampai 60, nyerang sampai 50, rest lagi. Gap 10 HP jadi buffer.
+local REST_HEALTH_THRESHOLD = 60
+-- [FIX-REST-ATTACK] Turun dari 1.3 ke 1.15: unit sekarat sekarang boleh
+-- counter-attack musuh lemah dengan peluang menang lebih tipis.
+local REST_ATTACK_RATIO_MIN = 1.15
 local REST_ATTACK_MIN_HEALTH_AFTER = 20
 
 ---Cari target musuh di sekitar unit sekarat yang layak diserang.
@@ -6894,7 +8135,8 @@ end
 -- [SPREAD-FIX] User request: 3 unit penjaga di ring capital (langsung tetangga capital).
 -- Capital sendiri tetap 1 unit (di-hold oleh DefensePlanner.capital).
 -- Sisanya bebas untuk spread ke border (lihat BorderPrep.gatherIdle mode OFF).
-local CAPITAL_RING_SIZE = 3
+-- [FIX-HOLD] Turun dari 3 ke 2 supaya unit sisa lebih banyak untuk front.
+local CAPITAL_RING_SIZE = 2
 local CAPITAL_RING_MIN_TOTAL_UNITS = 4
 
 ---@param world table
@@ -6905,6 +8147,12 @@ local CAPITAL_RING_MIN_TOTAL_UNITS = 4
 local function ensureCapitalRing(world, plan, capitalTile, zoneThreatened)
 	local record = MapGraph.tiles[capitalTile]
 	if record == nil then return 0 end
+
+	-- [HOTFIX-UNSHACKLE-RING] Saat perang tapi capital tidak terancam, jangan
+	-- sandera 2 unit di capital ring. Mereka dibutuhkan untuk offensive cleanup.
+	if next(world.enemies) ~= nil and not zoneThreatened then
+		return 0
+	end
 
 	local totalUnits = 0
 	for _, u in ipairs(world.ourUnits) do
@@ -7117,8 +8365,19 @@ function DefensePlanner.unsafe(world, plan, analysis, attackPlanner)
 			if entry ~= nil then table.insert(queue, entry) end
 		end
 		table.sort(queue, function(first, second)
-			if first.consequence ~= second.consequence then return first.consequence < second.consequence end
-			if first.threat.ratio ~= second.threat.ratio then return first.threat.ratio > second.threat.ratio end
+			-- [WAVE3-THREAT-FIRST-SORT] Minimize expected loss, not just tier order.
+			local firstScore = unsafeScore(first)
+			local secondScore = unsafeScore(second)
+			if firstScore ~= secondScore then return firstScore > secondScore end
+
+			local firstBreak = first.threat.breakSeconds or math.huge
+			local secondBreak = second.threat.breakSeconds or math.huge
+			if firstBreak ~= secondBreak then return firstBreak < secondBreak end
+
+			if first.threat.ratio ~= second.threat.ratio then
+				return first.threat.ratio > second.threat.ratio
+			end
+
 			return first.tile < second.tile
 		end)
 		queues[index] = queue
@@ -7141,17 +8400,64 @@ function DefensePlanner.unsafe(world, plan, analysis, attackPlanner)
 					local lanes = FrontAnalyzer.safeLanes(world, plan, defender)
 					local ranked = {}
 					if #lanes > 0 then
-						for _, candidate in ipairs(Tactics.availableNeighbours(world, plan, tileName)) do
-							if candidate.id ~= defender.id and candidate.owner == world.me and not candidate.flagged and world.tileOwner[candidate.tile] == world.me then
+						local candidatePool = Tactics.availableNeighbours(world, plan, tileName)
+						local farArrivalById = {}
+
+						if #candidatePool == 0 and entry.threat.breakSeconds ~= nil then
+							local farCandidates = {}
+							for _, unit in ipairs(plan:availableUnits()) do
+								if unit.id ~= defender.id
+									and unit.owner == world.me
+									and not unit.flagged
+									and world.tileOwner[unit.tile] == world.me
+									and analysis.contact[unit.tile] == nil then
+									table.insert(farCandidates, unit)
+								end
+							end
+
+							local deadline = entry.threat.breakSeconds * 0.75
+							local bestFar, farRanked = Tactics.earliestArrival(world, plan, farCandidates, tileName, deadline)
+							plan:decide(TIER_UNSAFE, "farReplacementProbe:" .. tileName, farRanked,
+								"emergency replacement from non-adjacent reserve before break")
+
+							if bestFar ~= nil then
+								candidatePool = { bestFar.unit }
+								farArrivalById[bestFar.unit.id] = bestFar
+							end
+						end
+
+						for _, candidate in ipairs(candidatePool) do
+							if candidate.id ~= defender.id
+								and candidate.owner == world.me
+								and not candidate.flagged
+								and world.tileOwner[candidate.tile] == world.me then
+
 								local placed = CombatModel.placedOn(candidate, tileName)
 								local threat = CombatModel.threat(world.combat, world, tileName, placed)
-								local hop = Pathing.hopSeconds(world.paths, candidate, candidate.tile, tileName)
+								local arrival = farArrivalById[candidate.id]
+								local hop = arrival and arrival.seconds
+									or Pathing.hopSeconds(world.paths, candidate, candidate.tile, tileName)
+								local path = arrival and arrival.path or { candidate.tile, tileName }
 								local originExposed = #FrontAnalyzer.adjacentEnemyUnits(world, candidate.tile) > 0
-								local qualifies = not threat.breaks and (enemyEntry == nil or hop < enemyEntry) and not originExposed
+								local qualifies = not threat.breaks
+									and (enemyEntry == nil or hop < enemyEntry)
+									and not originExposed
+
 								table.insert(ranked, {
-									id = candidate.id, score = threat.ratio,
-									facts = { troop = candidate.troopName, from = candidate.tile, threatRatio = threat.ratio, hopSeconds = hop, enemyEntrySeconds = enemyEntry, originExposed = originExposed, qualifies = qualifies },
-									unit = candidate, qualifies = qualifies,
+									id = candidate.id,
+									score = threat.ratio,
+									facts = {
+										troop = candidate.troopName,
+										from = candidate.tile,
+										threatRatio = threat.ratio,
+										hopSeconds = hop,
+										enemyEntrySeconds = enemyEntry,
+										originExposed = originExposed,
+										qualifies = qualifies,
+										path = path,
+									},
+									unit = candidate,
+									qualifies = qualifies,
 								})
 							end
 						end
@@ -7165,7 +8471,10 @@ function DefensePlanner.unsafe(world, plan, analysis, attackPlanner)
 					local best = ranked[1]
 					if best ~= nil and best.qualifies then
 						plan:assign(defender, { tileName, lanes[1] }, "swapOut", TIER_UNSAFE, "a better defender takes the tile", { threatRatio = entry.threat.ratio, lane = lanes[1] })
-						plan:assign(best.unit, { best.unit.tile, tileName }, "swapIn", TIER_UNSAFE, "holds the tile against the adjacent stack", best.facts)
+													plan:assign(best.unit, best.facts.path or { best.unit.tile, tileName },
+								"swapIn", TIER_UNSAFE,
+								"holds the tile against the adjacent stack",
+								best.facts)
 						fixed = true
 					end
 				end
@@ -7372,6 +8681,170 @@ function DefensePlanner.gaps(world, plan, analysis)
 			end
 		end
 	end
+end
+
+-- [REAR-GUARD] Deteksi musuh yang bergerak / projected ke arah supply source kita
+-- (port/capital). Kalau ada, kirim 1-2 unit untuk intercept sebelum supply dipotong.
+-- Ini fix langsung frustrasi "kena cut dari belakang".
+local REAR_MAX_INCOMING_CHECK = 10
+local REAR_MAX_INTERCEPTS = 2
+
+local function tileThreatensOurSupply(world, tileName, sourceSet)
+	if sourceSet[tileName] then return true end
+	local record = MapGraph.tiles[tileName]
+	if record == nil then return false end
+	for _, nbr in ipairs(record.landNeighbours) do
+		if sourceSet[nbr] then return true end
+	end
+	return false
+end
+
+function DefensePlanner.rearIntercept(world, plan, analysis)
+	if analysis == nil then return end
+	local sources = SupplyModel.sourcesOf(world, world.me)
+	if #sources == 0 then return end
+	local sourceSet = {}
+	for _, s in ipairs(sources) do sourceSet[s] = true end
+
+	local threats = {}
+
+	-- 1. Musuh yang sedang MOVING ke tile kita dekat supply source.
+	local incoming = FrontAnalyzer.incomingMoves(world)
+	local checked = 0
+	for _, entry in ipairs(incoming) do
+		if checked >= REAR_MAX_INCOMING_CHECK then break end
+		if world.tileOwner[entry.targetTile] == world.me then
+			checked += 1
+			local urgent = tileThreatensOurSupply(world, entry.targetTile, sourceSet)
+			if not urgent then
+				local cut = SupplyModel.unitsCutByLosing(world, world.me, entry.targetTile)
+				urgent = #cut > 0
+			end
+			if urgent then
+				table.insert(threats, {
+					unit = entry.unit, targetTile = entry.targetTile,
+					eta = entry.eta, kind = "incoming",
+				})
+			end
+		end
+	end
+
+	-- 2. Musuh IDLE yang projected route-nya mengancam supply source.
+	local projected = FrontAnalyzer.projectedEnemyRoutes(world)
+	for _, proj in ipairs(projected) do
+		local urgent = tileThreatensOurSupply(world, proj.targetTile, sourceSet)
+		if not urgent then
+			local cut = SupplyModel.unitsCutByLosing(world, world.me, proj.targetTile)
+			urgent = #cut > 0
+		end
+		if urgent then
+			table.insert(threats, {
+				unit = proj.unit, targetTile = proj.targetTile,
+				eta = proj.steps, kind = "projected",
+			})
+		end
+	end
+
+	if #threats == 0 then return end
+
+	table.sort(threats, function(a, b)
+		if a.kind ~= b.kind then return a.kind == "incoming" end
+		local aEta = a.eta or math.huge
+		local bEta = b.eta or math.huge
+		if aEta ~= bEta then return aEta < bEta end
+		return a.targetTile < b.targetTile
+	end)
+
+	local intercepted = 0
+	for _, threat in ipairs(threats) do
+		if intercepted >= REAR_MAX_INTERCEPTS then break end
+		if plan:isFreeDestination(threat.targetTile) then
+			local deadline = nil
+			if threat.kind == "incoming" and type(threat.eta) == "number" then
+				deadline = threat.eta * 0.9
+			end
+			local candidates = {}
+			for _, unit in ipairs(plan:availableUnits()) do
+				if not unit.flagged and analysis.contact[unit.tile] == nil then
+					table.insert(candidates, unit)
+				end
+			end
+			if #candidates > 0 then
+				local best, ranked = Tactics.earliestArrival(world, plan, candidates, threat.targetTile, deadline)
+				if best ~= nil then
+					local canMakeIt = (threat.kind == "projected")
+						or (type(threat.eta) == "number" and best.seconds < threat.eta)
+					if canMakeIt then
+						local placed = CombatModel.placedOn(best.unit, threat.targetTile)
+						local defence = CombatModel.threat(world.combat, world, threat.targetTile, placed)
+						if not defence.breaks then
+							plan:decide("T4", "rearIntercept:" .. threat.targetTile, ranked,
+								"enemy heading for our supply source")
+							plan:assign(best.unit, best.path, "rearGuard", "T4",
+								"intercept enemy threatening our supply source",
+								{ targetTile = threat.targetTile, kind = threat.kind, eta = threat.eta, seconds = best.seconds })
+							intercepted += 1
+						end
+					end
+				end
+			end
+		end
+	end
+	if intercepted > 0 then
+		Logger.info("Features.Front.DefensePlanner", "rearIntercepted", {
+			count = intercepted, threats = #threats,
+		})
+	end
+end
+
+function DefensePlanner.criticalCutsets(world, plan, analysis)
+	local cutsets = FrontAnalyzer.criticalCutsets(world, world.me, 4)
+	if #cutsets == 0 then return { guarded = 0 } end
+
+	local guarded = 0
+	for _, cutset in ipairs(cutsets) do
+		local tileName = cutset.tile
+		local occupant = world.unitsByTile[tileName]
+
+		if occupant ~= nil and occupant.owner == world.me then
+			if plan:isAvailable(occupant) then
+				plan:hold(occupant, "criticalSupplyHold", TIER_RESERVES,
+					"holds a tile whose loss cuts our supply",
+					{ cutUnits = cutset.cutUnits, value = cutset.value })
+				guarded += 1
+			end
+		elseif occupant == nil and plan:isFreeDestination(tileName) then
+			local candidates = {}
+			for _, unit in ipairs(plan:availableUnits()) do
+				if not unit.flagged and analysis.contact[unit.tile] == nil then
+					table.insert(candidates, unit)
+				end
+			end
+
+			if #candidates > 0 then
+				local enemyEntry = FrontAnalyzer.enemyEntrySeconds(world, tileName)
+				local deadline = enemyEntry and enemyEntry * 0.9 or nil
+				local best, ranked = Tactics.earliestArrival(world, plan, candidates, tileName, deadline)
+				if best ~= nil then
+					local placed = CombatModel.placedOn(best.unit, tileName)
+					local threat = CombatModel.threat(world.combat, world, tileName, placed)
+					if not threat.breaks then
+						plan:decide(TIER_RESERVES, "criticalSupplyGuard:" .. tileName, ranked,
+							"guard tile whose loss would cut our supply")
+						plan:assign(best.unit, best.path, "criticalSupplyGuard", TIER_RESERVES,
+							"guard a supply cutset before enemy can pincer it",
+							{ cutUnits = cutset.cutUnits, value = cutset.value, enemyEntrySeconds = enemyEntry, seconds = best.seconds, threatRatio = threat.ratio })
+						guarded += 1
+					end
+				end
+			end
+		end
+	end
+
+	if guarded > 0 then
+		Logger.info("Features.Front.DefensePlanner", "criticalCutsetsGuarded", { guarded = guarded, candidates = #cutsets })
+	end
+	return { guarded = guarded, candidates = #cutsets }
 end
 
 function DefensePlanner.stage(world, plan, analysis)
@@ -7952,6 +9425,61 @@ function FrontAnalyzer.pathInterdiction(world, plan, unit, path, horizonSeconds)
 	return cuttable
 end
 
+function FrontAnalyzer.criticalCutsets(world, countryName, maxCount)
+	world._criticalCutsetCache = world._criticalCutsetCache or {}
+	local cacheKey = tostring(countryName) .. "|" .. tostring(maxCount or 4)
+	local cached = world._criticalCutsetCache[cacheKey]
+	if cached ~= nil then return cached end
+
+	local list = {}
+	local reached = SupplyModel.suppliedTiles(world, countryName)
+	local checked = 0
+	local MAX_CHECKS = 40
+
+	for tileName in pairs(Ownership.countryTiles[countryName] or {}) do
+		if checked >= MAX_CHECKS then break end
+		if reached[tileName] then
+			local exposed = false
+			for _, nbr in ipairs(MapGraph.tiles[tileName].landNeighbours) do
+				local owner = world.tileOwner[nbr]
+				local unit = world.unitsByTile[nbr]
+				if (owner ~= nil and world.enemies[owner]) or (unit ~= nil and world.enemies[unit.owner]) then
+					exposed = true
+					break
+				end
+			end
+
+			if exposed then
+				checked += 1
+				local cut = SupplyModel.unitsCutByLosing(world, countryName, tileName)
+				if #cut > 0 then
+					local value = 0
+					for _, unit in ipairs(cut) do
+						value += (unit.health or 100) * (unit.attack or 1)
+					end
+					table.insert(list, {
+						tile = tileName,
+						cutUnits = #cut,
+						value = value,
+					})
+				end
+			end
+		end
+	end
+
+	table.sort(list, function(a, b)
+		if a.cutUnits ~= b.cutUnits then return a.cutUnits > b.cutUnits end
+		if a.value ~= b.value then return a.value > b.value end
+		return a.tile < b.tile
+	end)
+
+	local limit = math.min(maxCount or 4, #list)
+	local trimmed = {}
+	for i = 1, limit do trimmed[i] = list[i] end
+	world._criticalCutsetCache[cacheKey] = trimmed
+	return trimmed
+end
+
 function FrontAnalyzer.adjacentEnemyUnits(world, tileName)
 	local found = {}
 	for _, neighbourName in ipairs(MapGraph.tiles[tileName].landNeighbours) do
@@ -8018,6 +9546,7 @@ local FrontPlanner = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
 local Profiler = require("Utility/Profiler")
+local DebugFile = require("Utility/DebugFile")
 local Settings = require("Features/Core/Settings")
 local Plan = require("Features/Front/Plan")
 local FrontAnalyzer = require("Features/Front/FrontAnalyzer")
@@ -8031,9 +9560,96 @@ local SupplyModel = require("Features/Supply/SupplyModel")
 local MapGraph = require("Game/MapGraph")
 local BorderPrep = require("Features/Military/BorderPrep")
 local NavyPlanner = require("Features/Navy/NavyPlanner")
+local TimingCoordinator = require("Features/Combat/TimingCoordinator")
+local OperationPlanner = require("Features/Combat/OperationPlanner")
 
 local DEFCON_CAPITAL_RADIUS = 3
 local DEFCON_MIN_AGGRESSORS = 3
+
+-- [AGGRESSION-MODE] Adaptif: kalau kita unggul telak, AI jadi liar (blitz).
+-- Kalau imbang, main normal. Kalau lemah, sangat hati-hati.
+--   blitz     : power >= 2.5x musuh terkuat
+--   aggressive: power >= 1.5x
+--   normal    : power >= 0.8x
+--   defensive : power <  0.8x
+-- [HYSTERESIS] Ganti mode butuh ratio melampaui threshold + 10% margin.
+-- Mencegah flicker normal <-> aggressive saat ratio naik-turun di ~1.5.
+-- Contoh: dari normal, naik ke aggressive butuh ratio >= 1.5 * 1.10 = 1.65.
+--         dari aggressive, turun ke normal butuh ratio <  1.5 * 0.90 = 1.35.
+-- Zona 1.35-1.65 = hysteresis: mode tetap di state sebelumnya.
+local AGGRESSION_HYSTERESIS = 0.10
+local AGGRESSION_ORDER = { defensive = 0, normal = 1, aggressive = 2, blitz = 3 }
+
+local function computeAggressionMode(world)
+	local ourPower = 0
+	for _, u in ipairs(world.ourUnits) do
+		if u.state ~= "Dead" then
+			ourPower += (u.attack or 1) * (u.health or 1)
+		end
+	end
+	local enemyMaxPower = 0
+	for enemyName in pairs(world.enemies) do
+		local p = 0
+		for _, u in ipairs(world.unitsOf[enemyName] or {}) do
+			if u.state ~= "Dead" then
+				p += (u.attack or 1) * (u.health or 1)
+			end
+		end
+		if p > enemyMaxPower then enemyMaxPower = p end
+	end
+	local ratio = ourPower / math.max(enemyMaxPower, 1)
+
+	-- Hitung mode "raw" tanpa hysteresis.
+	local raw
+	if ratio >= 2.5 then raw = "blitz"
+	elseif ratio >= 1.5 then raw = "aggressive"
+	elseif ratio >= 0.8 then raw = "normal"
+	else raw = "defensive" end
+
+	-- [FIX-PASIF] Saat perang, minimal normal. Mode defensive terlalu ketat.
+	if raw == "defensive" and next(world.enemies) ~= nil then
+		raw = "normal"
+	end
+
+	local prev = world._aggressionModeLast
+	if prev == nil or prev == raw then
+		world._aggressionModeLast = raw
+		return raw, ratio
+	end
+
+	-- Mode berbeda: cek apakah ratio cukup jauh dari threshold.
+	local prevRank = AGGRESSION_ORDER[prev] or 1
+	local rawRank = AGGRESSION_ORDER[raw] or 1
+
+	-- Threshold naik: dari prev naik ke raw (misal normal -> aggressive = 1.5).
+	-- Threshold turun: dari prev turun ke raw (misal aggressive -> normal = 1.5).
+	-- Ambil threshold yang jadi pembatas.
+	local boundary
+	if rawRank > prevRank then
+		-- Naik: threshold di antara prev dan raw
+		if raw == "aggressive" then boundary = 1.5
+		elseif raw == "blitz" then boundary = 2.5
+		elseif raw == "normal" then boundary = 0.8
+		else boundary = 0 end
+		if ratio >= boundary * (1 + AGGRESSION_HYSTERESIS) then
+			world._aggressionModeLast = raw
+			return raw, ratio
+		end
+	else
+		-- Turun: threshold di prev (bukan raw)
+		if prev == "normal" then boundary = 0.8
+		elseif prev == "aggressive" then boundary = 1.5
+		elseif prev == "blitz" then boundary = 2.5
+		else boundary = 0 end
+		if ratio < boundary * (1 - AGGRESSION_HYSTERESIS) then
+			world._aggressionModeLast = raw
+			return raw, ratio
+		end
+	end
+
+	-- Belum melampaui hysteresis: tetap di mode lama.
+	return prev, ratio
+end
 
 -- [HUNT] Adaptive aggressiveness: skala ambang hunt dengan rasio kekuatan kita vs musuh terkuat.
 --   ratio >= 2.0  -> aggressive (minRatio 1.2, healthAfter 35, 6 hop)
@@ -8061,8 +9677,12 @@ local function computeHuntThresholds(world)
 
 	local ratio = ourPower / math.max(enemyMaxPower, 1)
 
-	if ratio >= 2.0 then
-		return { minRatio = 1.2, minHealthAfter = 35, maxHops = 6,
+	-- [AGGRESSION-MODE] Blitz: hunt sangat agresif (radius lebar, threshold rendah).
+	if ratio >= 2.5 then
+		return { minRatio = 1.1, minHealthAfter = 30, maxHops = 8,
+			powerRatio = ratio, mode = "blitz" }
+	elseif ratio >= 1.5 then
+		return { minRatio = 1.3, minHealthAfter = 35, maxHops = 7,
 			powerRatio = ratio, mode = "aggressive" }
 	elseif ratio >= 0.8 then
 		return { minRatio = 1.5, minHealthAfter = 40, maxHops = 6,
@@ -8131,6 +9751,12 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 	plan.allowArmyUnits = Settings.get("generals.enabled") == true
 	local analysis = Profiler.run("Front_Analyze", FrontAnalyzer.analyze, world, plan)
 
+	-- [AGGRESSION-MODE] Set sebelum tier jalan, dipakai AttackPlanner + Tactics.
+	world.aggressionMode, world.aggressionRatio = computeAggressionMode(world)
+	Logger.debug("Features.Front.FrontPlanner", "aggressionMode", {
+		mode = world.aggressionMode, ratio = world.aggressionRatio,
+	})
+
 	ThreatHeat.update(world)
 
 	local reserve = Profiler.run("Front_DeclareReserve", ReserveManager.declare, world, plan, analysis)
@@ -8183,6 +9809,14 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 			Profiler.run("Front_A0_Capitals", AttackPlanner.capitals, world, plan)
 		end
 
+		-- [HOTFIX-FINISHER] Tier A1b: habisi musuh sekarat lebih dulu. Satu unit
+		-- lemah cukup untuk menghapus musuh 15 HP; jangan sampai unitnya keburu
+		-- diambil kills/captures/hunt.
+		if #world.enemyUnits > 0 then
+			plan:beginTier("A1b")
+			Profiler.run("Front_A1b_Finishers", AttackPlanner.finishers, world, plan)
+		end
+
 		if #world.enemyUnits > 0 then
 			-- [FIX-CAP-3] Amankan koridor: bersihkan musuh yang mengancam memutus supply kita
 			-- di poros menuju capital, SEBELUM unit sisa dipakai untuk kills/pincers/captures.
@@ -8205,13 +9839,31 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 			Profiler.run("Front_A5_Pincers", AttackPlanner.pincers, world, plan)
 		end
 
-		-- [HUNT] Tier A6: kejar musuh killable off-poros untuk cegah flank.
-		plan:beginTier("A6")
-		Profiler.run("Front_A6_Hunt", AttackPlanner.hunt, world, plan, huntThresholds)
+		-- [RAID] Tier A2b: potong supply musuh dari belakang (kalau kita unggul).
+		-- Dijalankan setelah front utama diurus.
+		if kind == "tick" then
+			plan:beginTier("A2b")
+			Profiler.run("Front_A2b_Raid", AttackPlanner.raids, world, plan)
+		end
 
+		-- [HOTFIX-UNSHACKLE-HUNT-AFTER-CAPTURE] Captures/normal attacks harus
+		-- mengambil prioritas sebelum hunt off-axis. Sebelumnya A6 mencuri unit,
+		-- sehingga plan cuma berisi hunt dan front terlihat pasif.
 		if #plan:availableUnits() > 0 then
 			plan:beginTier("A3")
 			Profiler.run("Front_A34_Captures", AttackPlanner.captures, world, plan)
+		end
+
+		-- [HOTFIX-DUEL] Tier A3b: pecahkan stare-down sebelum unit diambil hunt.
+		if #plan:availableUnits() > 0 then
+			plan:beginTier("A3b")
+			Profiler.run("Front_A3b_Duels", AttackPlanner.duels, world, plan)
+		end
+
+		-- [HUNT] Tier A6: gunakan sisa unit untuk mengejar flanker/off-axis.
+		if #plan:availableUnits() > 0 then
+			plan:beginTier("A6")
+			Profiler.run("Front_A6_Hunt", AttackPlanner.hunt, world, plan, huntThresholds)
 		end
 	elseif defconActive then
 		Logger.info("Features.Front.FrontPlanner", "offensiveSkipped", {
@@ -8232,6 +9884,10 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 		Profiler.run("Front_BorderPrepHold", BorderPrep.holdActive, world, plan)
 
 		plan:beginTier("T4")
+		-- [REAR-GUARD] Guard cutset supply kita dulu, lalu intercept musuh yang
+		-- mengancam supply source sebelum unit sisa dipakai untuk cover gaps.
+		Profiler.run("Front_T4a_CriticalCutsets", DefensePlanner.criticalCutsets, world, plan, analysis)
+		Profiler.run("Front_T4b_RearIntercept", DefensePlanner.rearIntercept, world, plan, analysis)
 		Profiler.run("Front_T4_Gaps", DefensePlanner.gaps, world, plan, analysis)
 
 		Profiler.run("Front_T4_Stage", DefensePlanner.stage, world, plan, analysis)
@@ -8242,9 +9898,84 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 	else
 		plan:beginTier("T4")
 		Profiler.run("Front_T4_Gaps", DefensePlanner.gaps, world, plan, analysis)
+		-- [RESPONSIVE-RESERVE] Kalau ada unsafe atau gaps urgent, deploy reserve juga
+		-- di combat cycle (bukan hanya tick). Reaksi defensive jadi ~3s lebih cepat,
+		-- mencegah musuh memotong supply belakang saat front kritis.
+		if #analysis.unsafe > 0 or #analysis.gaps > 0 then
+			Profiler.run("Front_T4a_CriticalCutsets_Combat", DefensePlanner.criticalCutsets, world, plan, analysis)
+			Profiler.run("Front_T4b_RearIntercept_Combat", DefensePlanner.rearIntercept, world, plan, analysis)
+			Profiler.run("Front_T4_Stage_Combat", DefensePlanner.stage, world, plan, analysis)
+			Profiler.run("Front_ReserveStage_Combat", ReserveManager.stage, world, plan, reserve)
+		end
 	end
 
+	Profiler.run("Front_OperationPlanner", OperationPlanner.run, world, plan)
+	Profiler.run("Front_TimingCoordinator", TimingCoordinator.run, world, plan)
+
 	SupplyModel.logOurPrediction(world)
+
+	local purposeCounts = {}
+	local firstOrders = {}
+	for _, order in ipairs(plan.orders) do
+		purposeCounts[order.purpose] = (purposeCounts[order.purpose] or 0) + 1
+		if #firstOrders < 10 then
+			table.insert(firstOrders, {
+				unit = order.unitId,
+				purpose = order.purpose,
+				tier = order.tier,
+				from = order.fromTile,
+				destination = order.destination,
+				attack = order.isAttack,
+			})
+		end
+	end
+	local holdCount = 0
+	for _, entry in pairs(plan.byUnit) do
+		if entry.hold then holdCount += 1 end
+	end
+
+	shared.CTW_PlanDebug = {
+		build = shared.CTW_Build,
+		cycle = world.cycleLabel,
+		kind = kind,
+		ourUnits = #world.ourUnits,
+		enemyUnits = #world.enemyUnits,
+		enemies = world.enemies,
+		enemyDebug = world.enemyDebug,
+		borderCountries = world.borderCountries,
+		aggressionMode = world.aggressionMode,
+		aggressionRatio = world.aggressionRatio,
+		unsafe = #analysis.unsafe,
+		gaps = #analysis.gaps,
+		defcon = defconActive,
+		plan = plan:summary(),
+		holds = holdCount,
+		purposeCounts = purposeCounts,
+		captureDebug = world.captureDebug,
+		-- [HOTFIX-KILL-MARKED] berapa musuh bertanda yang terlihat tiap cycle
+		markedEnemies = (function()
+			local count = 0
+			for _, enemy in ipairs(world.enemyUnits) do
+				if enemy.flagged or enemy.liveFlag then count += 1 end
+			end
+			return count
+		end)(),
+		firstOrders = firstOrders,
+	}
+
+	DebugFile.writeJson("PlanDebug", shared.CTW_PlanDebug)
+
+	local planLine = string.format(
+		"[CTWDBG Plan] cycle=%s kind=%s mode=%s ratio=%.2f ours=%d enemy=%d orders=%d holds=%d unsafe=%d gaps=%d defcon=%s purposes=%s",
+		tostring(world.cycleLabel), tostring(kind), tostring(world.aggressionMode), world.aggressionRatio or 0,
+		#world.ourUnits, #world.enemyUnits, #plan.orders, holdCount, #analysis.unsafe, #analysis.gaps,
+		tostring(defconActive), game:GetService("HttpService"):JSONEncode(purposeCounts)
+	)
+	DebugFile.appendLineThrottled("DebugLog", planLine, 2.0)
+
+	if shared.CTW_DebugPrint ~= false then
+		print(planLine)
+	end
 
 	Logger.info("Features.Front.FrontPlanner", "planned", {
 		cycle = world.cycleLabel, kind = kind, summary = plan:summary(),
@@ -8273,10 +10004,10 @@ local Tracer = require("Utility/Tracer")
 local Formula = require("Utility/Formula")
 
 local ORDERABLE_STATES = { Idle = true, Moving = true, Waiting = true, Attacking = true }
--- [HUNT] A6 = tier hunt (di antara A5 pincers dan A3 captures).
-local TIER_RANK = { T0 = 1, T1 = 2, A1 = 2, T2 = 3, T3 = 4, A0a = 5, A0b = 6, A0 = 7, A2 = 8, A5 = 9, A6 = 9.5, A3 = 10, A4 = 10, AR = 11, T4 = 12, R = 13, P = 14, BP = 15, G = 16 }
+-- [HUNT] A6 = tier hunt. [RAID] A2b = supply harassment (setelah kills, sebelum pincers).
+local TIER_RANK = { T0 = 1, T1 = 2, A1 = 2, T2 = 3, T3 = 4, A0a = 5, A0b = 6, A0 = 7, A2 = 8, A2b = 8.5, A5 = 9, A6 = 9.5, A3 = 10, A4 = 10, A3b = 10.5, A1b = 7.5, AR = 11, T4 = 12, R = 13, P = 14, BP = 15, G = 16 }
 local UNKNOWN_TIER_RANK = math.huge
-local OFFENSIVE_TIERS = { A0a = true, A0b = true, A0 = true, A2 = true, A3 = true, A4 = true, A5 = true, A6 = true, AR = true }
+local OFFENSIVE_TIERS = { A0a = true, A0b = true, A0 = true, A2 = true, A2b = true, A3 = true, A4 = true, A5 = true, A6 = true, AR = true }
 
 Plan.TIER_RANK = TIER_RANK
 Plan.recentlyClearedTiles = {}
@@ -8352,22 +10083,26 @@ end
 
 -- [BUGFIX-C6] Refuse to overwrite an existing entry so callers can't silently clobber
 -- an assign from a previous tier with a hold.
+-- [FIX-ABORT] Dulu error() di sini membatalkan SELURUH cycle (Scheduler pakai pcall).
+-- Akibatnya order yang sudah di-plan hilang total -> AI diam beberapa detik.
+-- Sekarang cukup skip + warn, cycle tetap jalan.
 function Plan:hold(unit, purpose, tier, reason)
 	if self.byUnit[unit.id] ~= nil then
 		local existing = self.byUnit[unit.id]
-		return error(string.format(
-			"Plan:hold: unit %s already has a %s entry (purpose=%s, tier=%s); cannot hold with purpose=%s",
-			tostring(unit.id),
-			existing.hold and "hold" or (existing.halt and "halt" or "assign"),
-			tostring(existing.purpose),
-			tostring(existing.tier),
-			tostring(purpose)))
+		Logger.warn("Features.Front.Plan", "holdSkipped", {
+			unit = unit.id,
+			existingPurpose = existing.purpose,
+			existingTier = existing.tier,
+			attemptedPurpose = purpose,
+			attemptedTier = tier,
+			reason = "unit already has an entry from a previous tier",
+		})
+		return nil
 	end
 	self.byUnit[unit.id] = { unitId = unit.id, fromTile = unit.tile, purpose = purpose, tier = tier, reason = reason, hold = true }
 	self.tierCounts[tier] = (self.tierCounts[tier] or 0) + 1
-	self.byUnit[unit.id] = { unitId = unit.id, fromTile = unit.tile, purpose = purpose, tier = tier, reason = reason, hold = true }
-	self.tierCounts[tier] = (self.tierCounts[tier] or 0) + 1
 	self._availableCache = nil
+	return self.byUnit[unit.id]
 end
 
 function Plan:assign(unit, path, purpose, tier, reason, facts)
@@ -8499,7 +10234,8 @@ local SupplyModel = require("Features/Supply/SupplyModel")
 local Tactics = require("Features/Front/Tactics")
 
 local MIN_RESERVE_PER_AGGRESSOR = 1
-local MAX_RESERVE = 4
+-- [FIX-HOLD] Turun dari 4 ke 2 supaya tidak menyandera unit kuat seumur perang.
+local MAX_RESERVE = 2
 local STAGING_RADIUS_HOPS = 3
 
 function ReserveManager.declare(world, plan, analysis)
@@ -8524,9 +10260,24 @@ function ReserveManager.declare(world, plan, analysis)
 	local MIN_RESERVE_PEACE = 2
 	local target
 	if aggressorCount == 0 then
-		target = MIN_RESERVE_PEACE
+		-- [HOTFIX-UNSHACKLE-RESERVE] Kalau war sudah terdeteksi tapi tidak ada
+		-- aggressor adjacent dan kita blitz/aggressive, jangan simpan reserve pasif.
+		-- Ini kasus cleanup Portugal: enemies ada, tetapi front belum contact.
+		if enemiesExist and (world.aggressionMode == "blitz" or world.aggressionMode == "aggressive") then
+			target = 0
+		else
+			target = MIN_RESERVE_PEACE
+		end
 	else
 		target = math.min(MAX_RESERVE, aggressorCount * MIN_RESERVE_PER_AGGRESSOR)
+	end
+	if target <= 0 then
+		plan:declareReserve({})
+		Logger.info("Features.Front.ReserveManager", "declared", {
+			aggressors = aggressorCount, target = target, declared = 0, capitalTile = capitalTile,
+			reason = "offensive mode: no passive reserve without adjacent aggressors",
+		})
+		return {}
 	end
 	local capitalPosition = MapGraph.tiles[capitalTile].position
 	local candidates = {}
@@ -8739,21 +10490,50 @@ function Tactics.existingAttackers(world, targetTile)
 	return attackers
 end
 
-local function unitPriority(class, defenderClass, mode, unit)
+-- [COUNTER-AWARE] Priority berbasis multiplier counter numerik.
+--   Hard-counter (AntiTank->Tank, Tank->Infantry, Infantry->AntiTank): priority -2.
+--   Weak-counter (kita di-counter mereka): priority +6 (paling bawah).
+--   Netral: priority base.
+-- Tujuan: AI kirim unit yang trade-nya untung, bukan yang dihancurkan.
+local function unitPriority(class, defenderClass, mode, unit, defenderLevel)
 	if mode == "critical" then return 0 end
-	local row = HARD_COUNTER[class]
-	if row ~= nil and row[defenderClass] then
-		if unit ~= nil and (unit.health or 100) < 60 then return 1 end
-		return 0
+	local hardRow = HARD_COUNTER[class]
+	local isHardCounter = hardRow ~= nil and hardRow[defenderClass] == true
+	local isWeakCounter = false
+	if not isHardCounter then
+		local enemyRow = HARD_COUNTER[defenderClass]
+		if enemyRow ~= nil and enemyRow[class] == true then
+			isWeakCounter = true
+		end
 	end
-	if unit ~= nil and (unit.health or 100) < 60 then return 5 end
-	return CLASS_PRIORITY[class] or 2
+	-- [FIX-LEVEL] Level gap penalty (0..3). Kalau musuh lebih tinggi level,
+	-- unit kita kurang efektif walaupun class-nya hard-counter.
+	local levelGap = 0
+	if unit ~= nil and unit.level ~= nil and defenderLevel ~= nil then
+		levelGap = (defenderLevel - unit.level)
+		if levelGap < 0 then levelGap = 0 end
+		if levelGap > 3 then levelGap = 3 end
+	end
+	if isHardCounter then
+		local base = (unit ~= nil and (unit.health or 100) < 60) and -1 or -2
+		return base + levelGap * 2
+	end
+	if isWeakCounter then
+		if unit ~= nil and (unit.health or 100) < 60 then return 8 + levelGap end
+		return 6 + levelGap
+	end
+	if unit ~= nil and (unit.health or 100) < 60 then return 5 + levelGap end
+	return (CLASS_PRIORITY[class] or 2) + levelGap
 end
 
--- [PERF-WS] Cap candidate + pre-filter. Lihat header file untuk rasional.
-local MAX_STACK_CANDIDATES = 10
-local MAX_STACK_PREFILTER = 14
+-- [FIX-STACK-DEPTH] Sebelumnya 10/14 terlalu kecil: kalau ada 20 unit di
+-- sekitar target, yang terbaik mungkin tidak masuk Top-14. Naikkan supaya
+-- lebih banyak kandidat dievaluasi (biaya CPU masih OK, cycle ~50ms).
+local MAX_STACK_CANDIDATES = 15
+local MAX_STACK_PREFILTER = 20
 local MIN_SOLO_RATIO = 0.02
+-- [HOTFIX-DUEL-RATIO] ambang menang untuk mode "duel"
+local DUEL_MIN_WIN_RATIO = 1.08
 
 function Tactics.winningStack(world, plan, targetTile, candidates, mode)
 	local defender = world.unitsByTile[targetTile]
@@ -8769,14 +10549,16 @@ function Tactics.winningStack(world, plan, targetTile, candidates, mode)
 		if unit.tile ~= targetTile and Tactics.mayAttackFromHot(world, unit.tile, defender.owner) then
 			table.insert(preRanked, {
 				unit = unit,
-				priority = unitPriority(unit.class, defender.class, chosenMode, unit),
+				priority = unitPriority(unit.class, defender.class, chosenMode, unit, defender.level),
 			})
 		end
 	end
 	table.sort(preRanked, function(a, b)
 		if a.priority ~= b.priority then return a.priority < b.priority end
-		local aPow = (a.unit.attack or 1) * (a.unit.health or 100)
-		local bPow = (b.unit.attack or 1) * (b.unit.health or 100)
+		-- [FIX-EXP-PREF] Prefer veteran units: experience memberi +20% damage
+		-- per 1.0 E, jadi unit veteran lebih efektif dengan HP/attack yang sama.
+		local aPow = (a.unit.attack or 1) * (a.unit.health or 100) * (1 + (a.unit.experience or 0) * 0.2)
+		local bPow = (b.unit.attack or 1) * (b.unit.health or 100) * (1 + (b.unit.experience or 0) * 0.2)
 		if aPow ~= bPow then return aPow > bPow end
 		return a.unit.id < b.unit.id
 	end)
@@ -8789,18 +10571,35 @@ function Tactics.winningStack(world, plan, targetTile, candidates, mode)
 		local alone = CombatModel.engage(world.combat,
 			{ { unit = entry.unit, fromTile = entry.unit.tile } },
 			defender, targetTile, "attacker")
-		if alone.ratio >= MIN_SOLO_RATIO then
+				if alone.ratio >= MIN_SOLO_RATIO then
+			local hpAfter = alone.healthsAtBreak and alone.healthsAtBreak[1]
+				or alone.finalHealths and alone.finalHealths[1]
+				or (entry.unit.health or 100)
+
 			table.insert(scored, {
-				unit = entry.unit, alone = alone.ratio, priority = entry.priority,
+				unit = entry.unit,
+				alone = alone.ratio,
+				priority = entry.priority,
+				loss = (entry.unit.health or 100) - hpAfter,
+				breakSeconds = alone.breakSeconds or math.huge,
 			})
 		end
 	end
+	-- [FIX-TIEBREAK] Unit yang lebih dekat (jarak lurus) sampai lebih dulu.
+	local targetPosition = MapGraph.tiles[targetTile].position
 	table.sort(scored, function(first, second)
 		if first.priority ~= second.priority then return first.priority < second.priority end
 		local firstHP = first.unit.health or 100
 		local secondHP = second.unit.health or 100
+		if first.loss ~= second.loss then return first.loss < second.loss end
+		if first.breakSeconds ~= second.breakSeconds then return first.breakSeconds < second.breakSeconds end
 		if firstHP ~= secondHP then return firstHP > secondHP end
 		if first.alone ~= second.alone then return first.alone > second.alone end
+		local firstPos = MapGraph.tiles[first.unit.tile].position
+		local secondPos = MapGraph.tiles[second.unit.tile].position
+		local firstDist = (firstPos - targetPosition).Magnitude
+		local secondDist = (secondPos - targetPosition).Magnitude
+		if firstDist ~= secondDist then return firstDist < secondDist end
 		return first.unit.id < second.unit.id
 	end)
 
@@ -8808,6 +10607,16 @@ function Tactics.winningStack(world, plan, targetTile, candidates, mode)
 	local added = {}
 	local inStack = {}
 	for _, entry in ipairs(entries) do inStack[entry.unit.id] = true end
+
+	-- [ANTI-OVERKILL-PLAYER] Kalau target adalah PLAYER (bukan AI), cap stack.
+	-- Player bisa retreat/micro; mengirim 6 unit ke 1 tile player = unit stuck.
+	-- Cap 4 unit saat lawan player, unlimited saat lawan AI.
+	local targetIsPlayer = false
+	if defender.owner ~= nil then
+		local ok, isAI = pcall(Ownership.isAI, defender.owner)
+		if ok then targetIsPlayer = not isAI end
+	end
+	local MAX_ATTACKERS_VS_PLAYER = 4
 
 	local lastResult = nil
 	if #entries > 0 then
@@ -8819,7 +10628,13 @@ function Tactics.winningStack(world, plan, targetTile, candidates, mode)
 	end
 
 	-- [PERF-WS-3] Incremental loop sekarang di-cap MAX_STACK_CANDIDATES.
+	-- [ESCALATION] Two-pass:
+	--   Pass 1: cari stack MINIMUM yang menang.
+	--   Pass 2: kalau ratio menang masih < 1.6, tambah sampai 2 unit ekstra
+	--           supaya break lebih cepat (musuh tidak sempat heal/reinforce).
 	local incrementalLimit = math.min(#scored, MAX_STACK_CANDIDATES)
+	local firstWinIndex = nil
+	local firstWinResult = nil
 	for i = 1, incrementalLimit do
 		local entry = scored[i]
 		if not inStack[entry.unit.id] then
@@ -8828,21 +10643,134 @@ function Tactics.winningStack(world, plan, targetTile, candidates, mode)
 			table.insert(entries, newEntry)
 			table.insert(added, newEntry)
 			lastResult = CombatModel.engage(world.combat, entries, defender, targetTile, "attacker")
-			if lastResult.breaks and not lastResult.tie then
-				return { attackers = added, all = entries, result = lastResult }, {
-					existing = #existing, added = #added, ratio = lastResult.ratio,
-					mode = chosenMode, evaluated = i, candidatesTotal = #candidates,
-				}
+			-- [FIX-BUFFER] Butuh margin 1.25, bukan cuma 1.0. Prediksi kita sering
+			-- optimis (asumsi batch attack, padahal game sekuensial). Buffer 1.25
+			-- bikin kita nolak attack yang "menang tipis di atas kertas".
+					-- [FIX-LOSS-A] Buffer naik 1.25 -> 1.4 dan stack size minimum 2.
+		-- Stack 1-unit dengan ratio 1.3 sering kalah nyata karena prediksi
+		-- mengasumsikan batch arrival padahal game sekuensial.
+		local stackCount = #added + #existing
+		local minRatio = stackCount >= 3 and 1.25 or 1.4
+		-- [HOTFIX-DUEL-RATIO] Mode "duel": stare-down 1 tile. Buffer 1.4 bikin
+		-- adu 11-vs-8 (ratio ~1.3) ditolak -> winningStack balik nil -> dua-duanya
+		-- bengong. Di mode ini cukup prediksi menang tipis.
+		if chosenMode == "duel" then minRatio = DUEL_MIN_WIN_RATIO end
+		-- [HOTFIX-FINISHER] Target sekarat: cukup prediksi pecah (ratio >= 1.0).
+		-- Buffer 1.25/1.4 dibuat untuk adu stack sehat, bukan untuk eksekusi
+		-- musuh sisa setetes.
+		if chosenMode == "finisher" then minRatio = 1.0 end
+		if lastResult.breaks and not lastResult.tie and (lastResult.ratio or 0) >= minRatio then
+			firstWinIndex = i
+			firstWinResult = lastResult
+			break
+		end
+		end
+	end
+	if firstWinResult == nil then
+		return nil, {
+			existing = #existing,
+			candidates = #scored,
+			prefilter = evalLimit,
+			bestRatio = lastResult and lastResult.ratio or 0,
+			tie = lastResult and lastResult.tie or false,
+			mode = chosenMode,
+		}
+	end
+	-- [ANTI-OVERKILL-PLAYER] Terapkan cap sebelum escalation.
+		if targetIsPlayer and #entries > MAX_ATTACKERS_VS_PLAYER then
+		local savedEntries = table.clone(entries)
+		local savedAdded = table.clone(added)
+		local savedResult = firstWinResult
+
+		while #entries > MAX_ATTACKERS_VS_PLAYER and #added > 0 do
+			local removed = table.remove(added)
+			if removed ~= nil then
+				inStack[removed.unit.id] = nil
+			end
+			table.remove(entries)
+		end
+
+		lastResult = CombatModel.engage(world.combat, entries, defender, targetTile, "attacker")
+
+		if not (lastResult.breaks and not lastResult.tie and (lastResult.ratio or 0) >= 1.0) then
+			-- Cap terlalu ketat; restore minimum winning stack.
+			entries = savedEntries
+			added = savedAdded
+			for _, entry in ipairs(added) do
+				inStack[entry.unit.id] = true
+			end
+			lastResult = savedResult
+		end
+	end
+	-- [AGGRESSION-MODE] Escalation menyesuaikan mode.
+	--   blitz    : target 2.0, extra 3 (sangat agresif)
+	--   aggressive: 1.8, extra 2
+	--   normal   : 1.6, extra 2
+	--   defensive: 1.3, extra 1 (hemat unit)
+	local mode = world.aggressionMode or "normal"
+	local ESCALATION_TARGET_RATIO = 1.6
+	local ESCALATION_MAX_EXTRA = 2
+	if mode == "blitz" then
+		ESCALATION_TARGET_RATIO = 2.0
+		ESCALATION_MAX_EXTRA = 3
+	elseif mode == "aggressive" then
+		ESCALATION_TARGET_RATIO = 1.8
+	elseif mode == "defensive" then
+		ESCALATION_TARGET_RATIO = 1.3
+		ESCALATION_MAX_EXTRA = 1
+	end
+	local extraAdded = 0
+	if firstWinResult.ratio < ESCALATION_TARGET_RATIO then
+		for i = firstWinIndex + 1, incrementalLimit do
+			if extraAdded >= ESCALATION_MAX_EXTRA then break end
+			local entry = scored[i]
+			if not inStack[entry.unit.id] then
+				inStack[entry.unit.id] = true
+				local newEntry = { unit = entry.unit, fromTile = entry.unit.tile }
+				table.insert(entries, newEntry)
+				table.insert(added, newEntry)
+				extraAdded += 1
+				local escalated = CombatModel.engage(world.combat, entries, defender, targetTile, "attacker")
+				if escalated.breaks and not escalated.tie and (escalated.ratio or 0) >= 1.25 then
+					lastResult = escalated
+					if escalated.ratio >= ESCALATION_TARGET_RATIO then break end
+				else
+					-- Unit ekstra malah bikin stack tidak menang (jarang). Rollback.
+					inStack[entry.unit.id] = nil
+					table.remove(entries)
+					table.remove(added)
+					extraAdded -= 1
+				end
 			end
 		end
 	end
-	return nil, {
-		existing = #existing,
-		candidates = #scored,
-		prefilter = evalLimit,
-		bestRatio = lastResult and lastResult.ratio or 0,
-		tie = lastResult and lastResult.tie or false,
-		mode = chosenMode,
+
+	-- [WAVE1-STACK-CAP] Cap vs player harus tetap berlaku SETELAH escalation.
+	-- Sebelum patch ini, targetIsPlayer bisa lolos cap karena extra attacker ditambah
+	-- setelah blok cap awal. Karena stack pada cap awal sudah winning, trimming extra
+	-- attacker di sini mempertahankan win sambil menghindari over-commit vs player.
+	if targetIsPlayer and #entries > MAX_ATTACKERS_VS_PLAYER then
+		local trimmed = false
+		while #entries > MAX_ATTACKERS_VS_PLAYER and #added > 0 do
+			local removed = table.remove(added)
+			if removed ~= nil then
+				inStack[removed.unit.id] = nil
+			end
+			table.remove(entries)
+			extraAdded = math.max(0, extraAdded - 1)
+			trimmed = true
+		end
+		if trimmed then
+			lastResult = CombatModel.engage(world.combat, entries, defender, targetTile, "attacker")
+		end
+	end
+
+	return { attackers = added, all = entries, result = lastResult }, {
+		existing = #existing, added = #added, ratio = lastResult.ratio,
+		mode = chosenMode, evaluated = firstWinIndex + extraAdded,
+		candidatesTotal = #candidates,
+		escalation = extraAdded > 0 and "extended" or "immediate",
+		extraAdded = extraAdded,
 	}
 end
 
@@ -8948,6 +10876,11 @@ return Tactics
 MODULE_SOURCES["Features/Front/WorldView"] = [=[
 local WorldView = {}
 local Logger = require("Utility/Logger")
+-- [HOTFIX-WORLDVIEW-MAPGRAPH] MapGraph dipakai di blok borderCountries (hanya
+-- dieksekusi saat world.enemies KOSONG = kondisi damai) tapi tidak pernah
+-- di-require -> "attempt to index nil with 'tiles'" -> WorldView.build gagal
+-- SETIAP cycle saat damai -> tidak ada world, plan, economy, maupun file debug.
+local MapGraph = require("Game/MapGraph")
 local Tracer = require("Utility/Tracer")
 local Ownership = require("Game/Ownership")
 local Units = require("Game/Units")
@@ -9010,6 +10943,25 @@ function WorldView.build(ourCountry, cycleLabel)
 			Logger.warn("Features.Front.WorldView", "enemyCapitalUnknown", { enemy = enemyName, reason = enemyReason })
 		end
 	end
+	world.enemyDebug = Ownership.lastEnemyDebug[me]
+
+	-- [DIAG-ENEMY] If enemies empty, expose border countries so we can see
+	-- whether diplomacy replication or actual peace is the reason.
+	world.borderCountries = {}
+	if next(world.enemies) == nil then
+		for tileName in pairs(world.ourTiles) do
+			local record = MapGraph.tiles[tileName]
+			if record ~= nil then
+				for _, nbr in ipairs(record.landNeighbours) do
+					local owner = world.tileOwner[nbr]
+					if owner ~= nil and owner ~= me and not world.friends[owner] then
+						world.borderCountries[owner] = true
+					end
+				end
+			end
+		end
+	end
+
 	world.combat = CombatModel.newContext(world)
 	world.paths = Pathing.newContext(world)
 	if #world.duplicateTiles > 0 then
@@ -9106,7 +11058,12 @@ Formula.define({
 })
 
 function Pathing.newContext(world)
-	return { world = world, speedCoefs = {}, movement = {} }
+	return {
+		world = world,
+		speedCoefs = {},
+		movement = {},
+		hopCache = {},
+	}
 end
 
 function Pathing.stepOverheadSeconds()
@@ -9167,7 +11124,23 @@ local function hopSecondsFor(context, unit, fromName, toName)
 end
 
 function Pathing.hopSeconds(context, unit, fromName, toName)
-	return hopSecondsFor(context, unit, fromName, toName)
+	local key = tostring(unit.id) .. "|"
+		.. tostring(unit.owner) .. "|"
+		.. tostring(unit.class) .. "|"
+		.. tostring(unit.army) .. "|"
+		.. tostring(unit.speed) .. "|"
+		.. tostring(unit.noSupply) .. "|"
+		.. tostring(unit.noMoney) .. "|"
+		.. tostring(fromName) .. ">" .. tostring(toName)
+
+	local cached = context.hopCache[key]
+	if cached ~= nil then
+		return cached
+	end
+
+	local seconds = hopSecondsFor(context, unit, fromName, toName)
+	context.hopCache[key] = seconds
+	return seconds
 end
 
 Tracer.instrument("Features.Movement.Pathing", Pathing)
@@ -9267,8 +11240,10 @@ end
 function Pathing.pathSeconds(context, unit, path)
 	local total = 0
 	for index = FIRST_HOP_INDEX, #path do
-		total += hopSecondsFor(context, unit, path[index - 1], path[index])
-		if index > FIRST_HOP_INDEX then total += RECORDED_STEP_OVERHEAD_SECONDS end
+		total += Pathing.hopSeconds(context, unit, path[index - 1], path[index])
+		if index > FIRST_HOP_INDEX then
+			total += RECORDED_STEP_OVERHEAD_SECONDS
+		end
 	end
 	return total
 end
@@ -10485,6 +12460,7 @@ local Tracer = require("Utility/Tracer")
 
 ---@module Utility.Stats
 local Stats = require("Utility/Stats")
+local DebugFile = require("Utility/DebugFile")
 
 ---@module Game.MapGraph
 local MapGraph = require("Game/MapGraph")
@@ -10525,6 +12501,7 @@ OrderExecutor.leftArmy = {}
 OrderExecutor.ourCountryName = nil
 OrderExecutor.attackTargets = {}
 OrderExecutor.attackersOnTile = {}
+OrderExecutor.lastDebugPrintClock = 0
 
 local function pathJson(path, fromIndex)
 	local slice = {}
@@ -10556,13 +12533,14 @@ function OrderExecutor.commitments()
 	return OrderExecutor.committed
 end
 
-function OrderExecutor.repeatedTooSoon(order)
+function OrderExecutor.repeatedTooSoon(order, pathToSend)
 	local last = OrderExecutor.lastSent[order.unitId]
 	local period = Tick.periodSeconds()
+	local signature = table.concat(pathToSend or order.path, ",")
 
 	return last ~= nil
 		and period ~= nil
-		and last.signature == table.concat(order.path, ",")
+		and last.signature == signature
 		and os.clock() - last.clock < period
 end
 
@@ -10615,6 +12593,26 @@ local function validateAtSend(order)
 	return true, nil
 end
 
+
+local function smallOrderRecord(order, extra)
+	local record = {
+		unit = order.unitId,
+		purpose = order.purpose,
+		tier = order.tier,
+		from = order.fromTile,
+		destination = order.destination,
+		attack = order.isAttack,
+	}
+	if extra ~= nil then
+		for key, value in pairs(extra) do record[key] = value end
+	end
+	return record
+end
+
+local function pushLimited(list, item, limit)
+	if #list < (limit or 8) then table.insert(list, item) end
+end
+
 function OrderExecutor.execute(world, plan, canSend)
 	OrderExecutor.ourCountryName = world.me
 
@@ -10634,6 +12632,20 @@ function OrderExecutor.execute(world, plan, canSend)
 	end
 
 	local ordered = table.clone(plan.orders)
+
+	local function dependencyRank(order)
+		if order.purpose == "surround" or order.purpose == "capitalSurround" then
+			return 0
+		end
+		if order.purpose == "pincerCut" or order.purpose == "corridorClear" then
+			return 1
+		end
+		if order.isAttack then
+			return 2
+		end
+		return 3
+	end
+
 	table.sort(ordered, function(first, second)
 		local firstNeeded = needed[first] == true
 		local secondNeeded = needed[second] == true
@@ -10649,36 +12661,100 @@ function OrderExecutor.execute(world, plan, canSend)
 			return firstTier < secondTier
 		end
 
+		local firstDep = dependencyRank(first)
+		local secondDep = dependencyRank(second)
+		if firstDep ~= secondDep then
+			return firstDep < secondDep
+		end
+
+		-- [WAVE4-OPERATION-SCORE] Optional beam-lite operation scorer.
+		local firstScore = first.facts and first.facts.operationScore or nil
+		local secondScore = second.facts and second.facts.operationScore or nil
+		if firstScore ~= nil or secondScore ~= nil then
+			firstScore = firstScore or 0
+			secondScore = secondScore or 0
+			if firstScore ~= secondScore then
+				return firstScore > secondScore
+			end
+		end
+
 		return first.unitId < second.unitId
 	end)
 
-	local summary = { sent = 0, unchanged = 0, dryRun = 0, rejected = 0, halts = 0 }
+	local summary = { sent = 0, unchanged = 0, dryRun = 0, rejected = 0, halts = 0, delayed = 0, movingSuppressed = 0 }
+	-- [DIAG-ORDERS] Per-cycle buckets exposed through shared.CTW_OrderDebug.
+	local debugBuckets = {
+		sent = {}, rejected = {}, unchanged = {}, movingSuppressed = {}, delayed = {}, repeatSuppressed = {}, dryRun = {},
+	}
 
 	for _, order in ipairs(ordered) do
 		OrderExecutor.stats.planned += 1
 
 		local unit = world.unitsById[order.unitId]
+
+		-- [HOTFIX-ORDER-ACCEPT] Precompute actual path sent to server.
+		-- Saat perang executor sengaja mengirim one-hop, jadi acceptance/unchanged
+		-- harus dibandingkan ke sentDestination, bukan final destination plan.
+		local pathToSend = order.path
+		local atWar = next(world.enemies) ~= nil
+		if atWar and #order.path > 2 then
+			pathToSend = { order.path[1], order.path[2] }
+		end
+		local sentDestination = pathToSend[#pathToSend]
+
 		local destinationNow = unit and currentDestination(unit) or nil
 		local attackingTarget = unit ~= nil and unit.state == "Attacking" and unit.targetTile == order.destination
 		local commitment = OrderExecutor.committed[order.unitId]
-		local alreadyOrdered = commitment ~= nil and commitment.destination == order.destination
+		local alreadyOrdered = commitment ~= nil
+			and (commitment.destination == sentDestination or commitment.finalDestination == order.destination)
 
-		if destinationNow == order.destination or attackingTarget or alreadyOrdered then
+		if destinationNow == sentDestination or attackingTarget or alreadyOrdered then
 			OrderExecutor.stats.unchanged += 1
 			summary.unchanged += 1
+			pushLimited(debugBuckets.unchanged, smallOrderRecord(order, { current = destinationNow, sentDestination = sentDestination, alreadyOrdered = alreadyOrdered }))
+		elseif unit ~= nil and (unit.state == "Moving" or unit.state == "Waiting") then
+			-- [HOTFIX-MOVING-SPAM] Server sering tidak accept re-path unit yang
+			-- masih Moving/Waiting. Jangan spam MoveTroop; biarkan unit selesai
+			-- hop sekarang, Scheduler akan re-plan begitu Idle.
+			summary.movingSuppressed += 1
+			pushLimited(debugBuckets.movingSuppressed, smallOrderRecord(order, { state = unit.state, current = destinationNow, sentDestination = sentDestination }))
+			Logger.debug("Features.Orders.OrderExecutor", "movingSuppressed", {
+				unit = order.unitId,
+				state = unit.state,
+				currentDestination = destinationNow,
+				wanted = sentDestination,
+				purpose = order.purpose,
+			})
 		else
+			-- [WAVE4-TIMING-DELAY] Experimental orders can request a not-before
+			-- server time. No commitment is written; the next cycle will reconsider.
+			local notBefore = order.facts and order.facts.notBeforeServerTime
+			if type(notBefore) == "number" and world.serverTime < notBefore then
+				summary.delayed += 1
+				pushLimited(debugBuckets.delayed, smallOrderRecord(order, { notBefore = notBefore, now = world.serverTime }))
+				Logger.debug("Features.Orders.OrderExecutor", "timingDelayed", {
+					unit = order.unitId,
+					purpose = order.purpose,
+					destination = order.destination,
+					notBefore = notBefore,
+					now = world.serverTime,
+				})
+			else
 			local valid, why = validateAtSend(order)
 
 			if not valid then
 				OrderExecutor.stats.rejectedAtSend += 1
 				summary.rejected += 1
+				pushLimited(debugBuckets.rejected, smallOrderRecord(order, { reason = why, sentDestination = sentDestination }))
 				Logger.debug("Features.Orders.OrderExecutor", "rejectedAtSend", { unit = order.unitId, purpose = order.purpose, path = order.path, reason = why })
-			elseif canSend and OrderExecutor.repeatedTooSoon(order) then
+			elseif canSend and OrderExecutor.repeatedTooSoon(order, pathToSend) then
 				summary.repeatSuppressed = (summary.repeatSuppressed or 0) + 1
+				pushLimited(debugBuckets.repeatSuppressed, smallOrderRecord(order, { sentDestination = sentDestination }))
 				Logger.debug("Features.Orders.OrderExecutor", "repeatSuppressed", { unit = order.unitId, path = order.path, purpose = order.purpose })
 			elseif not canSend then
 				OrderExecutor.stats.dryRun += 1
 				summary.dryRun += 1
+				pushLimited(debugBuckets.dryRun, smallOrderRecord(order, { sentDestination = sentDestination }))
 
 				local signature = order.purpose .. "|" .. table.concat(order.path, ",")
 				if OrderExecutor.lastDryRun[order.unitId] == signature then
@@ -10696,17 +12772,12 @@ function OrderExecutor.execute(world, plan, canSend)
 					})
 				end
 			else
-				-- [ONE-HOP] At war, send only the first hop. The Scheduler's
-				-- ourUnitIdle trigger fires when the unit arrives, which
-				-- schedules a combat cycle immediately; the planner then
-				-- re-assigns the next hop from the unit's new position.
-				-- At peace, send the full path (no per-hop re-plan needed).
-				local pathToSend = order.path
-				local atWar = next(world.enemies) ~= nil
-				if atWar and #order.path > 2 then
-					pathToSend = { order.path[1], order.path[2] }
-				end
-
+				-- [FIX-REACTIVE] Dulu full-path dikirim saat wilayah aman, sehingga
+				-- unit jalan tanpa re-plan 8-15 hop sekaligus -> kelihatan "diam total"
+				-- saat musuh muncul di tengah jalan. Sekarang SELALU one-hop saat perang.
+				-- Scheduler akan fire combat cycle tiap kali unit sampai hop berikut
+				-- (via event ourUnitIdle), jadi planner re-evaluate tiap hop.
+				-- Delay per hop ~50ms (MIN_COMBAT_INTERVAL), jauh lebih responsif.
 				local instances = {}
 				for _, tileName in ipairs(pathToSend) do
 					table.insert(instances, MapGraph.tiles[tileName].instance)
@@ -10732,15 +12803,18 @@ function OrderExecutor.execute(world, plan, canSend)
 				OrderExecutor.pending[order.unitId] = pendingEntry
 				OrderExecutor.committed[order.unitId] = {
 					path = order.path,
+					sentPath = pathToSend,
 					purpose = order.purpose,
 					tier = order.tier,
-					destination = order.destination,
+					destination = sentDestination,
+					finalDestination = order.destination,
 					facts = order.facts,
 					sentClock = os.clock(),
 				}
 				OrderExecutor.stats.sent += 1
 				summary.sent += 1
-				OrderExecutor.lastSent[order.unitId] = { signature = table.concat(order.path, ","), clock = os.clock() }
+				pushLimited(debugBuckets.sent, smallOrderRecord(order, { sentDestination = sentDestination, pathToSend = pathToSend }))
+				OrderExecutor.lastSent[order.unitId] = { signature = table.concat(pathToSend, ","), clock = os.clock() }
 
 				Logger.info("Features.Orders.OrderExecutor", "sent", {
 					unit = order.unitId,
@@ -10751,6 +12825,7 @@ function OrderExecutor.execute(world, plan, canSend)
 					reason = order.reason,
 					facts = order.facts,
 				})
+			end
 			end
 		end
 	end
@@ -10766,6 +12841,40 @@ function OrderExecutor.execute(world, plan, canSend)
 		else
 			Logger.info("Features.Orders.OrderExecutor", "dryRunHalt", { unit = halt.unitId, tile = halt.fromTile, reason = halt.reason, facts = halt.facts })
 		end
+	end
+
+	local pendingCount = 0
+	for _ in pairs(OrderExecutor.pending) do pendingCount += 1 end
+	local committedCount = 0
+	for _ in pairs(OrderExecutor.committed) do committedCount += 1 end
+
+	shared.CTW_OrderDebug = {
+		build = shared.CTW_Build,
+		cycle = world.cycleLabel,
+		kind = world.cycleKind,
+		serverTime = world.serverTime,
+		canSend = canSend,
+		summary = summary,
+		stats = table.clone(OrderExecutor.stats),
+		pending = pendingCount,
+		committed = committedCount,
+		buckets = debugBuckets,
+	}
+
+	DebugFile.writeJson("OrderDebug", shared.CTW_OrderDebug)
+
+	local orderLine = string.format(
+		"[CTWDBG Orders] cycle=%s kind=%s plan=%d sent=%d accepted=%d notAcc=%d unchanged=%d movingSup=%d rejected=%d delayed=%d pending=%d committed=%d",
+		tostring(world.cycleLabel), tostring(world.cycleKind), OrderExecutor.stats.planned,
+		OrderExecutor.stats.sent, OrderExecutor.stats.accepted, OrderExecutor.stats.notAccepted,
+		summary.unchanged or 0, summary.movingSuppressed or 0, summary.rejected or 0,
+		summary.delayed or 0, pendingCount, committedCount
+	)
+	DebugFile.appendLineThrottled("DebugLog", orderLine, 2.0)
+
+	if shared.CTW_DebugPrint ~= false and os.clock() - OrderExecutor.lastDebugPrintClock > 2.0 then
+		OrderExecutor.lastDebugPrintClock = os.clock()
+		print(orderLine)
 	end
 
 	Logger.debug("Features.Orders.OrderExecutor", "executed", { cycle = world.cycleLabel, summary = summary, canSend = canSend })
@@ -10811,8 +12920,12 @@ local function onUnitChanged(record, attributeName, value)
 	local pendingEntry = OrderExecutor.pending[record.id]
 
 	if pendingEntry ~= nil then
+		-- [HOTFIX-ORDER-ACCEPT] Some server accepts only emit state/currentPath
+		-- changes after targetTile is already set. Count those as accepted too.
+		local liveTarget = record.model:GetAttribute("targetTile")
 		local accepted = (attributeName == "targetTile" and value == pendingEntry.expectedTarget)
 			or (attributeName == "currentPath" and (value == pendingEntry.expectedPathFromTarget or (pendingEntry.expectedPathAfterTarget ~= nil and value == pendingEntry.expectedPathAfterTarget)))
+			or ((attributeName == "state" or attributeName == "currentPath") and liveTarget == pendingEntry.expectedTarget)
 
 		if accepted then
 			local latency = os.clock() - pendingEntry.sentClock
@@ -10941,8 +13054,26 @@ local function checkTimeouts()
 			if record ~= nil and record.superseded then record = nil end
 
 			local stateNow = record and record.model:GetAttribute("state") or nil
+			local targetNow = record and record.model:GetAttribute("targetTile") or nil
+			local pathNow = record and record.model:GetAttribute("currentPath") or nil
+			local acceptedLate = targetNow == pendingEntry.expectedTarget
+				or pathNow == pendingEntry.expectedPathFromTarget
+				or (pendingEntry.expectedPathAfterTarget ~= nil and pathNow == pendingEntry.expectedPathAfterTarget)
 
-			if stateNow == "Defending" then
+			-- [HOTFIX-ORDER-ACCEPT] If the attribute already matches when timeout
+			-- runs, the order was accepted but the exact event was missed/suppressed.
+			if acceptedLate then
+				local latency = now - pendingEntry.sentClock
+				OrderExecutor.pending[unitId] = nil
+				OrderExecutor.stats.accepted += 1
+				Stats.pushBounded(OrderExecutor.acceptanceLatencies, latency, MAX_ACCEPTANCE_SAMPLES)
+				Logger.debug("Features.Orders.OrderExecutor", "acceptedLate", {
+					unit = unitId,
+					purpose = pendingEntry.order.purpose,
+					latencySeconds = latency,
+					targetTile = targetNow,
+				})
+			elseif stateNow == "Defending" then
 				pendingEntry.sentClock = now
 
 				if not pendingEntry.deferredLogged then
@@ -11983,6 +14114,7 @@ Ownership.countryTiles = {}
 Ownership.countryTileCounts = {}
 Ownership.unknownColors = {}
 Ownership.countMismatchStreaks = {}
+Ownership.lastEnemyDebug = {}
 Ownership.ownerChanged = Signal.new("Game.Ownership.ownerChanged")
 
 local function addTile(countryName, tileName)
@@ -12111,7 +14243,38 @@ function Ownership.diplomacyNames(countryName, folderName)
 end
 
 function Ownership.enemiesOf(countryName)
-	return Ownership.diplomacyNames(countryName, "Enemies")
+	-- [HOTFIX-ENEMY-REVERSE] Some game states replicate war one-sided for a few
+	-- ticks / formable transitions: their Diplomacy.Enemies contains us, but our
+	-- folder is empty. Treat the union as hostile so WarAI does not enter
+	-- peacetime while units are already fighting.
+	local direct = Ownership.diplomacyNames(countryName, "Enemies")
+	local enemies = {}
+	local directList = {}
+	local reverseList = {}
+
+	for name in pairs(direct) do
+		enemies[name] = true
+		table.insert(directList, name)
+	end
+
+	for otherName in pairs(Ownership.countries) do
+		if otherName ~= countryName and aliveByName(otherName) and not enemies[otherName] then
+			local ok, theirs = pcall(Ownership.diplomacyNames, otherName, "Enemies")
+			if ok and theirs[countryName] then
+				enemies[otherName] = true
+				table.insert(reverseList, otherName)
+			end
+		end
+	end
+
+	table.sort(directList)
+	table.sort(reverseList)
+	Ownership.lastEnemyDebug[countryName] = {
+		direct = directList,
+		reverse = reverseList,
+		total = enemies,
+	}
+	return enemies
 end
 
 function Ownership.friendsOf(countryName)
@@ -13391,6 +15554,121 @@ end
 return Tracer.instrument("Menu", Menu)
 ]=]
 
+
+MODULE_SOURCES["Utility/DebugFile"] = [=[
+--[[
+	Utility/DebugFile
+
+	File-based diagnostics for executors where Developer Console swallows print/warn.
+	Writes flat files in the executor workspace:
+	- CTW_WarAI_Boot.json
+	- CTW_WarAI_PlanDebug.json
+	- CTW_WarAI_OrderDebug.json
+	- CTW_WarAI_DebugLog.log
+]]
+
+local DebugFile = {}
+
+local HttpService = game:GetService("HttpService")
+local PREFIX = "CTW_WarAI_"
+
+DebugFile.lastAppend = {}
+DebugFile.files = {
+	Boot = PREFIX .. "Boot.json",
+	PlanDebug = PREFIX .. "PlanDebug.json",
+	OrderDebug = PREFIX .. "OrderDebug.json",
+	DebugLog = PREFIX .. "DebugLog.log",
+	-- [HOTFIX-PEACE-PIPELINE]
+	EcoDebug = PREFIX .. "EcoDebug.json",
+	-- [HOTFIX-PEACE-WATCHDOG]
+	Watchdog = PREFIX .. "Watchdog.json",
+	CycleError = PREFIX .. "CycleError.json",
+	TickDebug = PREFIX .. "TickDebug.json",
+}
+
+local function canWrite()
+	return type(writefile) == "function"
+end
+
+local function encode(value)
+	local ok, encoded = pcall(HttpService.JSONEncode, HttpService, value)
+	if ok then return encoded end
+	return HttpService:JSONEncode({ encodeError = tostring(encoded), tostring = tostring(value) })
+end
+
+local function nowString()
+	local serverTime = nil
+	pcall(function() serverTime = workspace:GetServerTimeNow() end)
+	return string.format("clock=%.3f server=%s", os.clock(), tostring(serverTime))
+end
+
+function DebugFile.writeJson(name, data)
+	if not canWrite() then
+		shared.CTW_DebugFileError = "writefile unavailable"
+		return false, "writefile unavailable"
+	end
+
+	local path = DebugFile.files[name] or (PREFIX .. tostring(name) .. ".json")
+	local payload = data or {}
+	if type(payload) == "table" then
+		payload._debugWrittenAt = nowString()
+		payload._debugPath = path
+	end
+
+	local encoded = encode(payload)
+	local ok, err = pcall(writefile, path, encoded)
+	shared.CTW_DebugFiles = DebugFile.files
+	if not ok then shared.CTW_DebugFileError = tostring(err) end
+	return ok, err
+end
+
+local function append(path, text)
+	if type(appendfile) == "function" then
+		return pcall(appendfile, path, text)
+	end
+
+	if type(readfile) == "function" and canWrite() then
+		local old = ""
+		if type(isfile) == "function" then
+			local okIsFile, exists = pcall(isfile, path)
+			if okIsFile and exists then
+				local okRead, read = pcall(readfile, path)
+				if okRead and type(read) == "string" then old = read end
+			end
+		end
+		-- Keep fallback log bounded.
+		if #old > 60000 then
+			old = string.sub(old, #old - 50000)
+		end
+		return pcall(writefile, path, old .. text)
+	end
+
+	return false, "appendfile/writefile unavailable"
+end
+
+function DebugFile.appendLine(name, line)
+	local path = DebugFile.files[name] or (PREFIX .. tostring(name) .. ".log")
+	local ok, err = append(path, nowString() .. " " .. tostring(line) .. "\n")
+	shared.CTW_DebugFiles = DebugFile.files
+	if not ok then shared.CTW_DebugFileError = tostring(err) end
+	return ok, err
+end
+
+function DebugFile.appendLineThrottled(name, line, seconds)
+	seconds = seconds or 2
+	local key = tostring(name)
+	local now = os.clock()
+	if DebugFile.lastAppend[key] ~= nil and now - DebugFile.lastAppend[key] < seconds then
+		return false, "throttled"
+	end
+	DebugFile.lastAppend[key] = now
+	return DebugFile.appendLine(name, line)
+end
+
+return DebugFile
+
+]=]
+
 MODULE_SOURCES["Utility/FileSink"] = [=[
 local FileSink = {}
 FileSink.__index = FileSink
@@ -14473,15 +16751,21 @@ local OrderExecutor = require("Features/Orders/OrderExecutor")
 local ActionDispatcher = require("Features/Orders/ActionDispatcher")
 local ArmyControl = require("Features/Orders/ArmyControl")
 local AirPlanner = require("Features/Air/AirPlanner")
+local CombatModel = require("Features/Combat/CombatModel")
 local Scorecard = require("Features/Review/Scorecard")
 local PlanOverlay = require("Features/Review/PlanOverlay")
 local WarAdvisor = require("Features/Diplomacy/WarAdvisor")
 local AntiIdle = require("Features/Core/AntiIdle")
 local Scheduler = require("Features/Core/Scheduler")
+-- [HOTFIX-WORLDVIEW-MAPGRAPH] watchdog memanggil Guard.check(); dulu require-nya
+-- salah tempat sehingga Guard == nil dan thread watchdog mati di iterasi pertama.
+local Guard = require("Features/Core/Guard")
 local Plan = require("Features/Front/Plan")
 local PeacetimePrep = require("Features/Diplomacy/PeacetimePrep")
 local BorderPrep = require("Features/Military/BorderPrep")
 local ThreatHeat = require("Features/Front/ThreatHeat")
+local DebugFile = require("Utility/DebugFile")
+local TimingCoordinator = require("Features/Combat/TimingCoordinator")
 
 local RAISE_SITE_STACK_LEVEL = 2
 local STATUS_KEYS = {}
@@ -14501,6 +16785,7 @@ function WarAI.buildWorld(reason)
 	Resolver.invalidate(reason)
 	-- [FIX-B3] state lintas-rebuild harus dibuang; kalau tidak, heat & lastStates menumpuk.
 	ThreatHeat.reset()
+	TimingCoordinator.reset(reason)
 	table.clear(Scheduler.lastStates)
 	-- [FIX-P1-4/P1-5] state lintas-rebuild di modul diplomatik juga harus dibuang.
 	WarAdvisor.lastRunTick = -100
@@ -14520,6 +16805,7 @@ function WarAI.onCountryChanged(country, reason)
 	Units.setOurCountry(countryName)
 	OrderExecutor.reset("country changed")
 	ActionDispatcher.reset("country changed")
+	TimingCoordinator.reset("country changed")
 	Resolver.invalidate("country changed")
 	Plan.clearRecentlyCleared()
 	Scheduler.refreshContext(countryName)
@@ -14529,16 +16815,45 @@ function WarAI.onCountryChanged(country, reason)
 	end
 end
 
+-- [HOTFIX-PEACE-PIPELINE] Tiap subsistem diisolasi: error di salah satu tidak
+-- boleh menghentikan sisanya. Hasil/kegagalan dicatat ke CTW_WarAI_TickDebug.json.
+local function safeRun(report, name, fn, ...)
+	if fn == nil then return end
+	local ok, err = pcall(fn, ...)
+	report[name] = ok and "ok" or tostring(err)
+	if not ok then
+		warn(string.format("[CTW_WarAI] %s failed: %s", name, tostring(err)))
+	end
+end
+
 function WarAI.onTick(world, analysis, plan)
-	EconomyPlanner.run(world, analysis)
-	ArmyControl.run(world, analysis)
-	AirPlanner.run(world, plan)
-	-- [AIR-r5] Fitur airfield management baru.
-	AirPlanner.runUpgrades(world, plan)
-	AirPlanner.runReposition(world, plan)
-	AirPlanner.runBuild(world)
-	AirPlanner.runPriority(world, plan)
-	AirPlanner.runNuke(world, plan)
+	local report = {
+		build = shared.CTW_Build,
+		cycle = world.cycleLabel,
+		kind = world.cycleKind,
+		hasPlan = plan ~= nil,
+		hasAnalysis = analysis ~= nil,
+		atWar = next(world.enemies or {}) ~= nil,
+	}
+	analysis = analysis or { contact = {}, unsafe = {}, gaps = {}, threats = {}, consequence = {} }
+
+	safeRun(report, "economy", EconomyPlanner.run, world, analysis)
+	safeRun(report, "armyControl", ArmyControl.run, world, analysis)
+	if plan ~= nil then
+		safeRun(report, "air", AirPlanner.run, world, plan)
+		-- [AIR-r5] Fitur airfield management baru.
+		safeRun(report, "airUpgrades", AirPlanner.runUpgrades, world, plan)
+		safeRun(report, "airReposition", AirPlanner.runReposition, world, plan)
+		safeRun(report, "airBuild", AirPlanner.runBuild, world)
+		safeRun(report, "airPriority", AirPlanner.runPriority, world, plan)
+		safeRun(report, "airNuke", AirPlanner.runNuke, world, plan)
+	else
+		report.air = "skipped: no plan (front disabled/failed)"
+	end
+	report.economySummary = EconomyPlanner.lastSummary
+	report.frontError = shared.CTW_FrontError
+	DebugFile.writeJson("TickDebug", report)
+	local okRest, restErr = pcall(function()
 	-- [TODO-NAVY] aktifkan saat fitur navy dipakai
 	Ownership.verifyCounts()
 	-- [FIX-H12] resolveStopped tidak pernah dipanggil: predictions menumpuk & attacksLost selalu 0.
@@ -14579,11 +16894,28 @@ function WarAI.onTick(world, analysis, plan)
 			"Consider justifying war on %s\nWin %.0f%% | Power %.2fx",
 			best.name, best.winProbability * 100, best.powerRatio))
 	end
+	end)
+	if not okRest then
+		report.menuAndAdvisors = tostring(restErr)
+		warn(string.format("[CTW_WarAI] tick tail failed: %s", tostring(restErr)))
+		DebugFile.writeJson("TickDebug", report)
+	end
 end
 
 function WarAI.attach()
 	maid = Maid.new("WarAI")
 	WarAI.defineCoreSettings()
+	DebugFile.writeJson("Boot", {
+		build = shared.CTW_Build,
+		placeId = game.PlaceId,
+		note = "WarAI.attach reached; file diagnostics active",
+	})
+
+	-- [FIX-CAS] Sync trustCAS dari Settings ke CombatModel.
+	CombatModel.setTrustCAS(Settings.get("combat.trustCAS"))
+	maid:give(Settings.onChanged("combat.trustCAS", function(value)
+		CombatModel.setTrustCAS(value)
+	end))
 
 	-- [FIX-GUI-ORDER] Muat GameModules + TechCatalog SEBELUM Menu.build().
 	-- Menu.build() memanggil getAvailableTechOptions() yang membaca TechCatalog.entries;
@@ -14642,6 +16974,90 @@ function WarAI.attach()
 	end)
 
 	WarAI.buildWorld("attach")
+
+	-- [HOTFIX-PEACE-WATCHDOG] Thread independen dari Scheduler. Saat damai tidak
+	-- ada combat trigger, jadi kalau dayTick/Guard/WorldView bermasalah TIDAK ADA
+	-- file apa pun yang ditulis dan AI terlihat "mati tanpa jejak". Loop ini
+	-- selalu menulis CTW_WarAI_Watchdog.json tiap 5 detik, apa pun keadaannya.
+	maid:give(task.spawn(function()
+		-- Tulis sekali SEGERA supaya ketahuan watchdog hidup, lalu tiap 5 detik.
+		pcall(DebugFile.writeJson, "Watchdog", { build = shared.CTW_Build, stage = "watchdog started", at = os.clock() })
+		while true do
+			local okLoop, loopError = pcall(function()
+			local snapshot = { build = shared.CTW_Build, at = os.clock() }
+
+			local okVerdict, verdict = pcall(Guard.check)
+			if okVerdict and type(verdict) == "table" then
+				snapshot.canPlan = verdict.canPlan
+				snapshot.canSend = verdict.canSend
+				snapshot.verdictReason = verdict.reason
+				snapshot.country = verdict.country and verdict.country.Name or nil
+			else
+				snapshot.verdictError = tostring(verdict)
+			end
+
+			local fresh, freshness = pcall(Tick.isFresh)
+			snapshot.tick = {
+				passes = Tick.passCount,
+				periodSeconds = Tick.periodSeconds(),
+				fresh = fresh and freshness or nil,
+				secondsSinceLastPass = Tick.lastPassClock and (os.clock() - Tick.lastPassClock) or nil,
+			}
+
+			local okSnap, schedulerSnap = pcall(Scheduler.debugSnapshot)
+			snapshot.scheduler = okSnap and schedulerSnap or tostring(schedulerSnap)
+
+			local okCountry, country = pcall(Session.ourCountry)
+			if okCountry and country ~= nil then
+				local okEnemies, enemies = pcall(Ownership.enemiesOf, country.Name)
+				if okEnemies then
+					local names = {}
+					for name in pairs(enemies) do table.insert(names, name) end
+					snapshot.enemies = names
+					snapshot.atWar = #names > 0
+				else
+					snapshot.enemiesError = tostring(enemies)
+				end
+			end
+
+			snapshot.economySummary = EconomyPlanner.lastSummary
+			snapshot.errors = {
+				cycle = shared.CTW_CycleError,
+				front = shared.CTW_FrontError,
+				economy = shared.CTW_EconomyError,
+				world = shared.CTW_WorldError,
+				onPlanned = shared.CTW_PlannedHookError,
+				debugFile = shared.CTW_DebugFileError,
+			}
+
+			DebugFile.writeJson("Watchdog", snapshot)
+			DebugFile.appendLineThrottled("DebugLog", string.format(
+				"[CTWDBG Watchdog] cycles=%s canPlan=%s atWar=%s sinceEco=%s sinceCycle=%s reason=%s",
+				tostring(Scheduler.cycleCount), tostring(snapshot.canPlan), tostring(snapshot.atWar),
+				tostring(snapshot.scheduler and snapshot.scheduler.secondsSinceEconomy),
+				tostring(snapshot.scheduler and snapshot.scheduler.secondsSinceCycle),
+				tostring(snapshot.verdictReason)), 5)
+
+			-- Damai = tidak ada combat trigger. Kalau sudah lama tidak ada cycle,
+			-- paksa satu tick supaya economy/research tetap jalan.
+			local since = Scheduler.lastCycle and Scheduler.lastCycle.at and (os.clock() - Scheduler.lastCycle.at) or math.huge
+			if since > 10 then
+				Scheduler.requestTick({ reason = "watchdog: no cycle for " .. string.format("%.0f s", since) })
+			end
+			end)
+			if not okLoop then
+				-- Watchdog TIDAK BOLEH mati diam-diam; itu yang terjadi di r20.
+				shared.CTW_WatchdogError = tostring(loopError)
+				pcall(DebugFile.writeJson, "Watchdog", {
+					build = shared.CTW_Build, stage = "watchdog error",
+					message = tostring(loopError), at = os.clock(),
+				})
+				pcall(writefile, "CTW_WarAI_Watchdog.txt", tostring(loopError))
+			end
+			task.wait(5)
+		end
+	end))
+
 	OrderExecutor.attach(maid)
 	ActionDispatcher.attach(maid)
 	Scorecard.attach(maid)
