@@ -431,9 +431,6 @@ local ATTACK_PURPOSES = {
 	corridorClear = true,
 	-- [HUNT] CAS juga bantu hunt biar pembunuhan lebih cepat.
 	hunt = true,
-	-- [PORT-V1-CAS] Tier serangan yang lahir setelah v1 tidak pernah didaftarkan,
-	-- jadi CAS tidak pernah mendukungnya. Daftarkan sekarang.
-	duel = true, finisher = true, raid = true,
 }
 
 Formula.define({
@@ -3653,7 +3650,7 @@ function SettingsCatalog.defineAll()
 	end
 	-- [FIX-BUILD] Sidik jari build: verifikasi versi yang benar-benar berjalan dengan SATU baris.
 	--   print(shared.CTW_Build, #shared.CTW_SettingsKeys)   -> r4 = 19, build lama = nil
-	shared.CTW_Build = "r24-cas-and-scoring"
+	shared.CTW_Build = "r23-kill-the-marked"
 	shared.CTW_SettingsKeys = {}
 	for _, definition in ipairs(Settings.definitions) do
 		table.insert(shared.CTW_SettingsKeys, definition.key)
@@ -4787,6 +4784,7 @@ local BUILTIN_RESEARCH_PRIORITY = {
 	"Infantry Armor II",
 	"Infantry Armor III",
 	"Infantry Armor IV",
+	"Nuclear Protection",
 	"Infantry Attack Equipment I",
 	"Infantry Attack Equipment II",
 	"Support Equipment I",
@@ -10009,10 +10007,7 @@ local ORDERABLE_STATES = { Idle = true, Moving = true, Waiting = true, Attacking
 -- [HUNT] A6 = tier hunt. [RAID] A2b = supply harassment (setelah kills, sebelum pincers).
 local TIER_RANK = { T0 = 1, T1 = 2, A1 = 2, T2 = 3, T3 = 4, A0a = 5, A0b = 6, A0 = 7, A2 = 8, A2b = 8.5, A5 = 9, A6 = 9.5, A3 = 10, A4 = 10, A3b = 10.5, A1b = 7.5, AR = 11, T4 = 12, R = 13, P = 14, BP = 15, G = 16 }
 local UNKNOWN_TIER_RANK = math.huge
--- [PORT-V1-SCORING] A3b (duel) ikut dikunci dari unit reserve seperti tier ofensif
--- lain. A1b (finisher) SENGAJA dibiarkan boleh memakai reserve: menghabisi musuh
--- bertanda/sekarat adalah pemakaian reserve yang paling murah dan paling untung.
-local OFFENSIVE_TIERS = { A0a = true, A0b = true, A0 = true, A2 = true, A2b = true, A3 = true, A4 = true, A5 = true, A6 = true, A3b = true, AR = true }
+local OFFENSIVE_TIERS = { A0a = true, A0b = true, A0 = true, A2 = true, A2b = true, A3 = true, A4 = true, A5 = true, A6 = true, AR = true }
 
 Plan.TIER_RANK = TIER_RANK
 Plan.recentlyClearedTiles = {}
@@ -13299,17 +13294,7 @@ local CombatModel = require("Features/Combat/CombatModel")
 local OrderExecutor = require("Features/Orders/OrderExecutor")
 
 -- Constants.
--- [PORT-V1-SCORING] Loop pengukuran v1 (Scorecard -> CombatModel.recordBreakOutcome
--- -> breakTimeBias) hanya mengenal 8 purpose lama, padahal sekarang mayoritas
--- serangan lahir dari tier baru. Akibatnya prediksi tidak pernah dikalibrasi oleh
--- hasil nyata tier-tier itu. Daftarnya disamakan dengan AirPlanner.
-local ATTACK_PURPOSES = {
-	capitalStrike = true, capitalApproach = true, capitalWalkIn = true, capitalStack = true,
-	capitalLaneClear = true, kill = true, surroundKill = true, relief = true, attack = true,
-	cutOffAttack = true, pincerCut = true, pathClear = true, laneClear = true,
-	walkIn = true, cutWalkIn = true, chase = true, attackContinue = true, attackPin = true,
-	corridorClear = true, hunt = true, duel = true, finisher = true, raid = true,
-}
+local ATTACK_PURPOSES = { capitalStrike = true, kill = true, surroundKill = true, relief = true, attack = true, cutOffAttack = true, pincerCut = true, hunt = true }
 local BEATEN_STATES = { Retreating = true, Dead = true }
 -- [BUGFIX-C4]
 local MAX_BREAK_ERROR_SAMPLES = 256
