@@ -38,6 +38,120 @@
 
 local MODULE_SOURCES = {}
 
+MODULE_SOURCES["Features/Review/Dashboard"] = [=[
+--[[
+	Features/Review/Dashboard
+
+	Ringkasan performa 1 sesi. Dipanggil di akhir WarAI.detach() atau via
+	WarAI.report(). Berguna untuk tuning cepat antar-session.
+]]
+
+local Dashboard = {}
+
+---@module Utility.Tracer
+local Tracer = require("Utility/Tracer")
+
+---@module Features.Review.Scorecard
+local Scorecard = require("Features/Review/Scorecard")
+
+---@module Features.Orders.OrderExecutor
+local OrderExecutor = require("Features/Orders/OrderExecutor")
+
+---@module Features.Orders.ActionDispatcher
+local ActionDispatcher = require("Features/Orders/ActionDispatcher")
+
+---@module Features.Combat.CombatModel
+local CombatModel = require("Features/Combat/CombatModel")
+
+---@module Features.Core.Scheduler
+local Scheduler = require("Features/Core/Scheduler")
+
+---@module Game.Tick
+local Tick = require("Game/Tick")
+
+---Format angka dengan unit.
+local function fmt(value, unit)
+	if value == nil then return "-" end
+	return string.format("%.3f %s", value, unit or "")
+end
+
+---Print ringkasan ke Logger.
+function Dashboard.report()
+	local score = Scorecard.summary()
+	local lat = Scheduler.latencyStats()
+	local interval, intervalSrc = CombatModel.hitIntervalSeconds()
+	local period = Tick.periodSeconds()
+
+	local openAttacks = score.open or 0
+	local won = score.attacksWon or 0
+	local lost = score.attacksLost or 0
+	local total = won + lost
+	local winRate = total > 0 and (won / total * 100) or 0
+
+	Logger.info("Features.Review.Dashboard", "report", {
+		-- Waktu
+		tickPeriod = fmt(period, "s"),
+		hitInterval = fmt(interval, "s"),
+		hitIntervalSource = intervalSrc,
+
+		-- Reaksi
+		reactions = lat.count or 0,
+		medianReactionMs = lat.median and (lat.median * 1000) or nil,
+		maxReactionMs = lat.max and (lat.max * 1000) or nil,
+
+		-- Combat
+		attacksWon = won,
+		attacksLost = lost,
+		attacksOpen = openAttacks,
+		winRatePercent = winRate,
+		medianBreakErrorSeconds = score.medianBreakErrorSeconds,
+		interruptions = score.interruptions,
+
+		-- Orders
+		ordersSent = OrderExecutor.stats.sent,
+		ordersAccepted = OrderExecutor.stats.accepted,
+		ordersNotAccepted = OrderExecutor.stats.notAccepted,
+		ordersDryRun = OrderExecutor.stats.dryRun,
+		ordersRejected = OrderExecutor.stats.rejectedAtSend,
+		userOverrides = OrderExecutor.stats.userOverrides,
+
+		-- Actions
+		actionsSent = ActionDispatcher.stats.dispatched,
+		actionsDryRun = ActionDispatcher.stats.dryRun,
+		actionsDuplicates = ActionDispatcher.stats.duplicates,
+		actionsFailures = ActionDispatcher.stats.failures,
+		actionsRefused = ActionDispatcher.stats.refusals,
+	})
+
+	-- Print human-readable.
+	local lines = {
+		"",
+		"=== CTW_WarAI Session Report ===",
+		string.format("Tick period     : %.3f s", period or 0),
+		string.format("Hit interval    : %.3f s (%s)", interval, intervalSrc),
+		"",
+		string.format("Reactions       : %d (median %.0f ms, max %.0f ms)", lat.count or 0,
+			(lat.median or 0) * 1000, (lat.max or 0) * 1000),
+		"",
+		string.format("Attacks won/lost: %d / %d (%.1f%% win rate)", won, lost, winRate),
+		string.format("Open attacks    : %d", openAttacks),
+		score.medianBreakErrorSeconds and string.format("Break error     : %+.2f s median", score.medianBreakErrorSeconds) or "Break error     : -",
+		"",
+		string.format("Orders sent     : %d (accepted %d, unaccepted %d)",
+			OrderExecutor.stats.sent, OrderExecutor.stats.accepted, OrderExecutor.stats.notAccepted),
+		string.format("Actions sent    : %d (failures %d, refusals %d, dry-run %d)",
+			ActionDispatcher.stats.dispatched, ActionDispatcher.stats.failures,
+			ActionDispatcher.stats.refusals, ActionDispatcher.stats.dryRun),
+		"",
+	}
+	for _, line in ipairs(lines) do
+		print(line)
+	end
+end
+
+return Tracer.instrument("Features.Review.Dashboard", Dashboard)
+]=]
+
 MODULE_SOURCES["Features/Front/ThreatHeat"] = [=[
 --[[
 	Features/Front/ThreatHeat
@@ -1153,21 +1267,14 @@ Tracer.instrument("Features.Combat.CombatModel", CombatModel)
 ---@return table engagement result plus { breakSeconds, attackers = the input list, hitIntervalSource }
 function CombatModel.engage(context, attackers, defender, defenderTile, ourSide)
 	-- [SPRINT-3] Cache key: attacker ids + defender id + defender health bucket.
-	local cacheKey
-	if #attackers == 1 then
-		local a = attackers[1]
-		cacheKey = a.unit.id .. ":" .. defender.id .. ":" .. math.floor((defender.health or 100) / 5) .. ":" .. ourSide
-	else
-		local keyParts = {}
-		for _, entry in ipairs(attackers) do
-			table.insert(keyParts, entry.unit.id)
-		end
-		table.insert(keyParts, defender.id)
-		table.insert(keyParts, math.floor((defender.health or 100) / 5))
-		table.insert(keyParts, ourSide)
-		cacheKey = table.concat(keyParts, ",")
+	local keyParts = {}
+	for _, entry in ipairs(attackers) do
+		table.insert(keyParts, tostring(entry.unit.id))
 	end
-
+	table.insert(keyParts, tostring(defender.id))
+	table.insert(keyParts, tostring(math.floor((defender.health or 100) / 5)))
+	table.insert(keyParts, ourSide)
+	local cacheKey = table.concat(keyParts, ",")
 	local cached = context.engageCache and context.engageCache[cacheKey]
 	if cached ~= nil then
 		return cached
@@ -1390,6 +1497,8 @@ return Tracer.instrument("Features.Core.Guard", Guard)
 
 ]=]
 
+-- >>> PART 2/3 START
+
 MODULE_SOURCES["Features/Core/Scheduler"] = [=[
 --[[
 	Features/Core/Scheduler
@@ -1505,19 +1614,6 @@ local function runPending()
 		return
 	end
 
-	if kind == "combat" then
-		local now = os.clock()
-		local elapsed = now - (Scheduler.lastCombatCycleClock or 0)
-		if elapsed < 0.10 then
-			if not Scheduler.scheduled then
-				Scheduler.scheduled = true
-				task.delay(0.10 - elapsed, runPending)
-			end
-			return
-		end
-		Scheduler.lastCombatCycleClock = now
-	end
-
 	Scheduler.running = true
 	Scheduler.cycleCount += 1
 
@@ -1558,13 +1654,13 @@ world.tickNumber = (tickInfo ~= nil and tickInfo.tickNumber) or 0
 			local latency = os.clock() - earliest
 			table.insert(Scheduler.reactionLatencies, latency)
 
-			Logger.debug("Features.Core.Scheduler", "reaction", {
-                kind = kind,
-                triggers = names,
-                firstTrigger = triggers[1],
-                latencySeconds = latency,
-                orders = summary,
-            })
+			Logger.info("Features.Core.Scheduler", "reaction", {
+				kind = kind,
+				triggers = names,
+				firstTrigger = triggers[1],
+				latencySeconds = latency,
+				orders = summary,
+			})
 		end
 
 		if kind == "tick" and Scheduler.hooks.onTick ~= nil then
@@ -2019,36 +2115,19 @@ local SWITCHES = {
 }
 
 function SettingsCatalog.defineAll()
-    for _, switch in ipairs(SWITCHES) do
-        Settings.define({
-            key = switch.key,
-            tab = switch.tab,
-            section = switch.section,
-            label = switch.label,
-            kind = "toggle",
-            unit = "on/off",
-            default = switch.default,
-            defaultSource = switch.defaultSource,
-            effect = switch.effect,
-        })
-    end
-    -- [OPT-LOG batch-1] dropdown log level
-    local Logger = require("Utility/Logger")
-    Settings.define({
-        key = "log.level",
-        tab = "AI",
-        section = "Client",
-        label = "Log level (file)",
-        kind = "dropdown",
-        unit = "level",
-        choices = { "TRACE", "DEBUG", "INFO", "WARN", "ERROR" },
-        default = "WARN",
-        defaultSource = "batch-1 log cleanup; WARN keeps only warnings/errors",
-        effect = "Verbosity of CTW_WarAI_log.txt.",
-    })
-    Settings.onChanged("log.level", function(value)
-        Logger.setLevel(value)
-    end)
+	for _, switch in ipairs(SWITCHES) do
+		Settings.define({
+			key = switch.key,
+			tab = switch.tab,
+			section = switch.section,
+			label = switch.label,
+			kind = "toggle",
+			unit = "on/off",
+			default = switch.default,
+			defaultSource = switch.defaultSource,
+			effect = switch.effect,
+		})
+	end
 end
 
 return Tracer.instrument("Features.Core.SettingsCatalog", SettingsCatalog)
@@ -2765,9 +2844,9 @@ function EconomyPlanner.run(world, analysis)
 	end
 
 	summary.moneyLeftInPlan = budget.money
-    EconomyPlanner.lastSummary = summary
+	EconomyPlanner.lastSummary = summary
 
-    Logger.debug("Features.Economy.EconomyPlanner", "planned", summary)
+	Logger.info("Features.Economy.EconomyPlanner", "planned", summary)
 end
 
 return Tracer.instrument("Features.Economy.EconomyPlanner", EconomyPlanner)
@@ -3244,7 +3323,9 @@ return TechCatalog
 
 ]=]
 
-MODULE_SOURCES["Features/Front/AttackPlanner"] = [[
+-- >>> PART 3/3 START
+
+MODULE_SOURCES["Features/Front/AttackPlanner"] = [=[
 local AttackPlanner = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -3284,33 +3365,43 @@ AttackPlanner.reportedLosing = {}
 ---@param world table
 ---@return table { [enemyName] = { score, unitCount, tileCount, capitalDistance } }
 function AttackPlanner.enemyPriority(world)
-	if world.enemyPriorities ~= nil then
-		return world.enemyPriorities
-	end
-	local priorities = {}
-	local ourCapital = world.capitalTile
-	local ourPos = ourCapital and MapGraph.tiles[ourCapital] and MapGraph.tiles[ourCapital].position
+local priorities = {}
+
 	for enemyName in pairs(world.enemies) do
 		local units = world.unitsOf[enemyName] or {}
 		local unitCount = #units
-		-- Gunakan cache O(1) dari Ownership, bukan loop pairs(world.tileOwner)!
-		local tileCount = Ownership.countryTileCounts[enemyName] or 0
+
+		local tileCount = 0
+		local tiles = world.tileOwner
+		for _, owner in pairs(tiles) do
+			if owner == enemyName then
+				tileCount += 1
+			end
+		end
+
+		-- Jarak ibu kota musuh ke ibu kota kita (musuh dekat = prioritas lebih tinggi).
 		local capitalDistance = math.huge
 		local enemyCapital = world.enemyCapitals[enemyName]
-		if enemyCapital ~= nil and ourPos ~= nil and MapGraph.tiles[enemyCapital] ~= nil then
-			capitalDistance = (MapGraph.tiles[enemyCapital].position - ourPos).Magnitude
+		if enemyCapital ~= nil and world.capitalTile ~= nil then
+			local enemyPos = MapGraph.tiles[enemyCapital].position
+			local ourPos = MapGraph.tiles[world.capitalTile].position
+			capitalDistance = (enemyPos - ourPos).Magnitude
 		end
+
+		-- Skor: kecil = mudah dihabisi. Unit weight 1.0, tile weight 0.15,
+		-- jarak weight 0.0005 (0.5 stud = 0.00025 poin).
+		local score = unitCount * 1.0 + tileCount * 0.15 + capitalDistance * 0.0005
+
 		priorities[enemyName] = {
-			score = unitCount * 1.0 + tileCount * 0.15 + capitalDistance * 0.0005,
+			score = score,
 			unitCount = unitCount,
 			tileCount = tileCount,
 			capitalDistance = capitalDistance,
 		}
 	end
-	world.enemyPriorities = priorities
+
 	return priorities
 end
-
 -- === END FITUR 2 =============================================================
 
 local function strikers(world, plan, tileName, targetOwner)
@@ -3943,8 +4034,9 @@ function AttackPlanner.reviewOngoing(world, plan)
 end
 
 return Tracer.instrument("Features.Front.AttackPlanner", AttackPlanner)
-]]
+]=]
 
+-- === [CHANGED FASE-2 + HOTFIX-3] Features/Front/DefensePlanner ==================================
 MODULE_SOURCES["Features/Front/DefensePlanner"] = [=[
 --[[
 	Features/Front/DefensePlanner
@@ -4059,6 +4151,15 @@ local function chooseHandoffTile(world, plan, frontTile, replacement)
 	end
 	table.sort(choices)
 	return choices[1]
+end
+
+local function pendingHandoffIsLive(world, handoff)
+	local defender = world.unitsById[handoff.defenderId]
+	local replacement = world.unitsById[handoff.replacementId]
+	return defender ~= nil and replacement ~= nil
+		and defender.owner == world.me and replacement.owner == world.me
+		and defender.tile == handoff.frontTile
+		and replacement.tile ~= handoff.frontTile
 end
 
 local function processPendingHandoffs(world, plan)
@@ -4662,6 +4763,7 @@ end
 return Tracer.instrument("Features.Front.DefensePlanner", DefensePlanner)
 ]=]
 
+-- === [CHANGED FASE-2+4] Features/Front/FrontAnalyzer ============================================
 MODULE_SOURCES["Features/Front/FrontAnalyzer"] = [=[
 --[[
 	Features/Front/FrontAnalyzer
@@ -4841,7 +4943,6 @@ function FrontAnalyzer.analyze(world, plan)
 		end
 	end
 	local capitalDist = capitalDistances(world)
-	analysis.capitalDistances = capitalDist
 	table.sort(analysis.unsafe, function(first, second)
 		if first.consequence ~= second.consequence then return first.consequence < second.consequence end
 		local firstDist = capitalDist[first.tile] or math.huge
@@ -4867,22 +4968,20 @@ function FrontAnalyzer.analyze(world, plan)
 		if first.enemyEntrySeconds ~= second.enemyEntrySeconds then return first.enemyEntrySeconds < second.enemyEntrySeconds end
 		return first.tile < second.tile
 	end)
-	if Logger.accepts("DEBUG") then
-		local unsafeSummary = {}
-		for _, entry in ipairs(analysis.unsafe) do
-			table.insert(unsafeSummary, {
-				tile = entry.tile, troop = entry.unit.troopName, health = entry.unit.health, flagged = entry.flagged,
-				ratio = entry.threat.ratio, breakSeconds = entry.threat.breakSeconds,
-				attackers = #entry.threat.attackers, consequence = entry.consequence,
-			})
-		end
-		local contactCount = 0
-		for _ in pairs(analysis.contact) do contactCount += 1 end
-		Logger.debug("Features.Front.FrontAnalyzer", "analysis", {
-			contactTiles = contactCount, unsafe = unsafeSummary, gaps = #analysis.gaps,
-			firstGaps = { table.unpack(analysis.gaps, 1, math.min(LOGGED_GAPS, #analysis.gaps)) },
+	local unsafeSummary = {}
+	for _, entry in ipairs(analysis.unsafe) do
+		table.insert(unsafeSummary, {
+			tile = entry.tile, troop = entry.unit.troopName, health = entry.unit.health, flagged = entry.flagged,
+			ratio = entry.threat.ratio, breakSeconds = entry.threat.breakSeconds,
+			attackers = #entry.threat.attackers, consequence = entry.consequence,
 		})
 	end
+	local contactCount = 0
+	for _ in pairs(analysis.contact) do contactCount += 1 end
+	Logger.debug("Features.Front.FrontAnalyzer", "analysis", {
+		contactTiles = contactCount, unsafe = unsafeSummary, gaps = #analysis.gaps,
+		firstGaps = { table.unpack(analysis.gaps, 1, math.min(LOGGED_GAPS, #analysis.gaps)) },
+	})
 	return analysis
 end
 
@@ -4890,9 +4989,6 @@ Tracer.instrument("Features.Front.FrontAnalyzer", FrontAnalyzer)
 
 -- === [FASE-2] theater clustering ===
 function FrontAnalyzer.theaters(world, analysis)
-	if analysis.theaters ~= nil then
-		return analysis.theaters
-	end
 	local contactList = {}
 	for tileName in pairs(analysis.contact) do table.insert(contactList, tileName) end
 	table.sort(contactList)
@@ -4957,7 +5053,6 @@ function FrontAnalyzer.theaters(world, analysis)
 		if first.threatSum ~= second.threatSum then return first.threatSum > second.threatSum end
 		return first.tiles[1] < second.tiles[1]
 	end)
-	analysis.theaters = theaters
 	return theaters
 end
 
@@ -5174,12 +5269,24 @@ local function detectDefcon(world, analysis)
 	if world.capitalTile == nil then
 		return false, { aggressors = count, reason = "capital unknown" }
 	end
-	-- [GUARD CACHE] Menggunakan capitalDistances yang sudah ada dari FrontAnalyzer
-	local capitalDist = analysis.capitalDistances or {}
+	local nearCapital = { [world.capitalTile] = 0 }
+	local queue = { world.capitalTile }
+	local head = 1
+	while head <= #queue do
+		local current = queue[head]
+		head += 1
+		if nearCapital[current] < DEFCON_CAPITAL_RADIUS then
+			for _, neighbourName in ipairs(MapGraph.tiles[current].landNeighbours) do
+				if nearCapital[neighbourName] == nil and world.tileOwner[neighbourName] == world.me then
+					nearCapital[neighbourName] = nearCapital[current] + 1
+					table.insert(queue, neighbourName)
+				end
+			end
+		end
+	end
 	local threatNearCapital = {}
 	for _, entry in ipairs(analysis.unsafe) do
-		local dist = capitalDist[entry.tile]
-		if dist ~= nil and dist > 0 and dist <= DEFCON_CAPITAL_RADIUS then
+		if nearCapital[entry.tile] ~= nil and entry.tile ~= world.capitalTile then
 			table.insert(threatNearCapital, entry.tile)
 		end
 	end
@@ -5221,11 +5328,11 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 		local totalAvailable = #plan:availableUnits()
 		local quotas = TheaterManager.computeQuotas(world, zones, totalAvailable)
 		plan:applyTheaterQuotas(quotas)
-        Logger.debug("Features.Front.FrontPlanner", "theatersBuilt", {
-            theaterCount = #zones.theaters,
-            totalAvailable = totalAvailable,
-            quotas = quotas,
-        })
+		Logger.info("Features.Front.FrontPlanner", "theatersBuilt", {
+			theaterCount = #zones.theaters,
+			totalAvailable = totalAvailable,
+			quotas = quotas,
+		})
 	end
 
 	-- [FASE-3] defcon detection
@@ -5316,23 +5423,18 @@ function FrontPlanner.plan(world, blockedUnits, commitments, kind)
 
 	SupplyModel.logOurPrediction(world)
 
-    local plannedSummary = plan:summary()
-    local plannedPayload = {
-        cycle = world.cycleLabel, kind = kind, summary = plannedSummary,
-        unsafeTiles = #analysis.unsafe, gaps = #analysis.gaps, defcon = defconActive,
-    }
-    if defconActive or (kind == "tick" and plannedSummary.orders > 0) then
-        Logger.info("Features.Front.FrontPlanner", "planned", plannedPayload)
-    else
-        Logger.debug("Features.Front.FrontPlanner", "planned", plannedPayload)
-    end
+	Logger.info("Features.Front.FrontPlanner", "planned", {
+		cycle = world.cycleLabel, kind = kind, summary = plan:summary(),
+		unsafeTiles = #analysis.unsafe, gaps = #analysis.gaps, defcon = defconActive,
+	})
 
-    return plan, analysis
+	return plan, analysis
 end
 
 return Tracer.instrument("Features.Front.FrontPlanner", FrontPlanner)
 ]=]
 
+-- === [CHANGED FASE-1] Features/Front/Plan =======================================================
 MODULE_SOURCES["Features/Front/Plan"] = [=[
 --[[
 	Features/Front/Plan
@@ -5523,6 +5625,7 @@ end
 return Plan
 ]=]
 
+-- === [NEW FASE-1] Features/Front/ReserveManager =================================================
 MODULE_SOURCES["Features/Front/ReserveManager"] = [=[
 --[[
 	Features/Front/ReserveManager
@@ -5535,6 +5638,7 @@ local ReserveManager = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
 local MapGraph = require("Game/MapGraph")
+local TheaterManager = require("Features/Front/TheaterManager")  -- [MULTI-FRONT]
 local FrontAnalyzer = require("Features/Front/FrontAnalyzer")
 local SupplyModel = require("Features/Supply/SupplyModel")
 local Tactics = require("Features/Front/Tactics")
@@ -5597,12 +5701,12 @@ function ReserveManager.declare(world, plan, analysis)
 	end
 	plan:declareReserve(reserve)
 	local names = {}
-    for name in pairs(aggressors) do table.insert(names, name) end
-    table.sort(names)
-    Logger.debug("Features.Front.ReserveManager", "declared", {
-        aggressors = aggressorCount, aggressorCountries = names,
-        target = target, declared = declared, capitalTile = capitalTile,
-    })
+	for name in pairs(aggressors) do table.insert(names, name) end
+	table.sort(names)
+	Logger.info("Features.Front.ReserveManager", "declared", {
+		aggressors = aggressorCount, aggressorCountries = names,
+		target = target, declared = declared, capitalTile = capitalTile,
+	})
 	return reserve
 end
 
@@ -5662,6 +5766,7 @@ end
 return Tracer.instrument("Features.Front.ReserveManager", ReserveManager)
 ]=]
 
+-- === [NEW MULTI-FRONT] Features/Front/TheaterManager ============================================
 MODULE_SOURCES["Features/Front/TheaterManager"] = [=[
 --[[
 	Features/Front/TheaterManager
@@ -5808,7 +5913,9 @@ end
 return Tracer.instrument("Features.Front.TheaterManager", TheaterManager)
 ]=]
 
-MODULE_SOURCES["Features/Front/RetreatManager"] = [[
+-- === unchanged modules below this line ===
+
+MODULE_SOURCES["Features/Front/RetreatManager"] = [=[
 local RetreatManager = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -5836,7 +5943,7 @@ function RetreatManager.protect(world, plan, analysis)
 end
 
 return Tracer.instrument("Features.Front.RetreatManager", RetreatManager)
-]]
+]=]
 
 MODULE_SOURCES["Features/Front/Tactics"] = [=[
 --[[
@@ -6084,7 +6191,7 @@ end
 return Tactics
 ]=]
 
-MODULE_SOURCES["Features/Front/WorldView"] = [[
+MODULE_SOURCES["Features/Front/WorldView"] = [=[
 local WorldView = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -6175,9 +6282,9 @@ function WorldView.enemiesOf(world, countryName)
 end
 
 return WorldView
-]]
+]=]
 
-MODULE_SOURCES["Features/Movement/Pathing"] = [[
+MODULE_SOURCES["Features/Movement/Pathing"] = [=[
 local Pathing = {}
 local Tracer = require("Utility/Tracer")
 local Resolver = require("Utility/Resolver")
@@ -6451,7 +6558,12 @@ function Pathing.retreatSeconds(unit, fromName, toName)
 end
 
 return Pathing
-]]
+]=]
+
+-- <<< PART 3/3 END
+-- ===============================================================================================
+-- SISA MODUL — tempel tepat setelah PART 3/3 END (sebelum epilogue loader)
+-- ===============================================================================================
 
 MODULE_SOURCES["Features/Navy/NavyPlanner"] = [=[
 --[[
@@ -6610,7 +6722,7 @@ function NavyPlanner.run(world)
 	end
 
 	if #threats > 0 then
-        Logger.debug("Features.Navy.NavyPlanner", "enemyTransports", { fleets = threats })
+		Logger.warn("Features.Navy.NavyPlanner", "enemyTransports", { fleets = threats })
 
 		-- Bangun kandidat landing site: laut yang bersebelahan dengan daratan kita.
 		local landingSites = {}
@@ -6661,10 +6773,10 @@ function NavyPlanner.run(world)
 		-- Tandai tick invasi.
 		coastGuardState.lastInvasionTick = world.tickNumber or 0
 
-		Logger.debug("Features.Navy.NavyPlanner", "coastalThreats", {
-            sites = siteList,
-            reason = "invasi terdeteksi, defense akan memprioritaskan tile ini",
-        })
+		Logger.warn("Features.Navy.NavyPlanner", "coastalThreats", {
+			sites = siteList,
+			reason = "invasi terdeteksi, defense akan memprioritaskan tile ini",
+		})
 	end
 
 	Logger.debug("Features.Navy.NavyPlanner", "run", { fleets = #fleets, enemyLoadedFleets = #threats, docking = docked })
@@ -7186,22 +7298,33 @@ end
 ---@param order table
 ---@return boolean, string?
 local function validateAtSend(order)
-	local record = Units.recordById and Units.recordById[order.unitId]
-	if record == nil or record.superseded then
+	local record = nil
+
+	for candidate in pairs(Units.records) do
+		if candidate.id == order.unitId and not candidate.superseded then
+			record = candidate
+		end
+	end
+
+	if record == nil then
 		return false, "unit no longer exists"
 	end
+
 	if record.tile ~= order.fromTile then
 		return false, string.format("unit moved to %s since planning", record.tile)
 	end
+
 	local state = record.model:GetAttribute("state")
 	if state == "Defending" or state == "Retreating" or state == "Dead" then
 		return false, "unit is " .. tostring(state)
 	end
+
 	for index = TARGET_INDEX, #order.path - 1 do
 		if Units.liveUnitOn(order.path[index]) ~= nil then
 			return false, string.format("intermediate tile %s is occupied", order.path[index])
 		end
 	end
+
 	return true, nil
 end
 
@@ -7296,6 +7419,9 @@ function OrderExecutor.execute(world, plan, canSend)
 					table.insert(instances, MapGraph.tiles[tileName].instance)
 				end
 
+				Logger.info("Features.Orders.OrderExecutor", "debugSendPre",
+					{ unit = order.unitId, path = order.path, purpose = order.purpose,
+					  serverTime = workspace:GetServerTimeNow() })
 				Remotes.send("MoveTroop", instances)
 
 				OrderExecutor.userControlled[order.unitId] = nil
@@ -7314,8 +7440,10 @@ function OrderExecutor.execute(world, plan, canSend)
 				end
 
 				OrderExecutor.pending[order.unitId] = pendingEntry
-                pendingEntry.sentServerTime = workspace:GetServerTimeNow()
-                OrderExecutor.committed[order.unitId] = {
+				pendingEntry.sentServerTime = workspace:GetServerTimeNow()
+				Logger.info("Features.Orders.OrderExecutor", "debugSendPost",
+					{ unit = order.unitId, serverTime = pendingEntry.sentServerTime })
+				OrderExecutor.committed[order.unitId] = {
 					path = order.path,
 					purpose = order.purpose,
 					tier = order.tier,
@@ -7370,11 +7498,13 @@ local function onUnitChanged(record, attributeName, value)
 	local pendingEntry = OrderExecutor.pending[record.id]
 
 	if pendingEntry ~= nil then
-        if attributeName == "targetTile" or attributeName == "currentPath" or attributeName == "state" then
-            Logger.trace("Features.Orders.OrderExecutor", "debugAttrChange",
-                { unit = record.id, attr = attributeName })
-        end
-        local accepted = (attributeName == "targetTile" and value == pendingEntry.expectedTarget)
+		if attributeName == "targetTile" or attributeName == "currentPath" or attributeName == "state" then
+			Logger.info("Features.Orders.OrderExecutor", "debugAttrChange",
+				{ unit = record.id, attr = attributeName, value = value,
+				  expectedTarget = pendingEntry.expectedTarget,
+				  serverTime = workspace:GetServerTimeNow() })
+		end
+		local accepted = (attributeName == "targetTile" and value == pendingEntry.expectedTarget)
 			or (attributeName == "currentPath" and (value == pendingEntry.expectedPathFromTarget or (pendingEntry.expectedPathAfterTarget ~= nil and value == pendingEntry.expectedPathAfterTarget)))
 
 		if accepted then
@@ -7471,9 +7601,11 @@ local function checkTimeouts()
 
 	for unitId, pendingEntry in pairs(OrderExecutor.pending) do
 		if now - pendingEntry.sentClock > period then
-			local record = Units.recordById and Units.recordById[unitId]
-			if record and record.superseded then
-				record = nil
+			local record = nil
+			for candidate in pairs(Units.records) do
+				if candidate.id == unitId and not candidate.superseded then
+					record = candidate
+				end
 			end
 
 			local stateNow = record and record.model:GetAttribute("state") or nil
@@ -7543,6 +7675,127 @@ function OrderExecutor.reset(reason)
 end
 
 return Tracer.instrument("Features.Orders.OrderExecutor", OrderExecutor)
+
+]=]
+
+MODULE_SOURCES["Features/Review/PlanOverlay"] = [=[
+--[[
+	Features/Review/PlanOverlay
+
+	Draws the last cycle's planned orders over the map (ui.showPlans): one thin bar per hop of every
+	order, coloured by what the order is for, plus a marker on every locked tile.
+	=== [REV] A5 added to ATTACK_TIERS (pincer). ===
+]]
+
+local PlanOverlay = {}
+
+---@module Utility.Logger
+local Logger = require("Utility/Logger")
+
+---@module Utility.Tracer
+local Tracer = require("Utility/Tracer")
+
+---@module Game.MapGraph
+local MapGraph = require("Game/MapGraph")
+
+---@module Features.Core.Settings
+local Settings = require("Features/Core/Settings")
+
+-- Constants (display only).
+local FOLDER_NAME = "CTW_WarAI_Plan"
+local BAR_THICKNESS = 0.6
+local HEIGHT_ABOVE_TILE = 1.5
+local LOCK_MARKER_SIZE = 1.2
+local BAR_TRANSPARENCY = 0.25
+local COLOR_ATTACK = Color3.fromRGB(235, 64, 52)
+local COLOR_DEFENCE = Color3.fromRGB(52, 152, 235)
+local COLOR_MOVE = Color3.fromRGB(200, 200, 200)
+local COLOR_LOCK = Color3.fromRGB(245, 212, 66)
+local ATTACK_TIERS = { A0 = true, A1 = true, A2 = true, A3 = true, A4 = true, A5 = true }
+local DEFENCE_TIERS = { T0 = true, T1 = true, T2 = true, T3 = true }
+local HALF = 0.5
+local FIRST_HOP_INDEX = 2
+
+-- State.
+PlanOverlay.folder = nil
+
+---The overlay folder (created on first use, owned by the caller's maid).
+---@param maid table
+---@return Folder
+local function folderFor(maid)
+	if PlanOverlay.folder == nil or PlanOverlay.folder.Parent == nil then
+		local folder = Instance.new("Folder")
+		folder.Name = FOLDER_NAME
+		folder.Parent = workspace
+		PlanOverlay.folder = folder
+		maid:give(folder)
+	end
+
+	return PlanOverlay.folder
+end
+
+---A display part.
+---@param parent Instance
+---@param size Vector3
+---@param cframe CFrame
+---@param color Color3
+local function addPart(parent, size, cframe, color)
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Material = Enum.Material.Neon
+	part.Transparency = BAR_TRANSPARENCY
+	part.Color = color
+	part.Size = size
+	part.CFrame = cframe
+	part.Parent = parent
+end
+
+---Redraw the overlay for a plan.
+---@param plan table
+---@param maid table
+function PlanOverlay.draw(plan, maid)
+	local folder = folderFor(maid)
+	folder:ClearAllChildren()
+
+	if not Settings.get("ui.showPlans") then
+		return
+	end
+
+	local lift = Vector3.new(0, HEIGHT_ABOVE_TILE, 0)
+	local bars = 0
+
+	for _, order in ipairs(plan.orders) do
+		local color = COLOR_MOVE
+		if ATTACK_TIERS[order.tier] then
+			color = COLOR_ATTACK
+		elseif DEFENCE_TIERS[order.tier] then
+			color = COLOR_DEFENCE
+		end
+
+		for index = FIRST_HOP_INDEX, #order.path do
+			local fromPosition = MapGraph.tiles[order.path[index - 1]].position + lift
+			local toPosition = MapGraph.tiles[order.path[index]].position + lift
+			local length = (toPosition - fromPosition).Magnitude
+			local centre = fromPosition:Lerp(toPosition, HALF)
+
+			addPart(folder, Vector3.new(BAR_THICKNESS, BAR_THICKNESS, length), CFrame.lookAt(centre, toPosition), color)
+			bars += 1
+		end
+	end
+
+	for tileName in pairs(plan.locks) do
+		local position = MapGraph.tiles[tileName].position + lift
+		addPart(folder, Vector3.new(LOCK_MARKER_SIZE, LOCK_MARKER_SIZE, LOCK_MARKER_SIZE), CFrame.new(position), COLOR_LOCK)
+	end
+
+	Logger.trace("Features.Review.PlanOverlay", "drawn", { bars = bars })
+end
+
+return Tracer.instrument("Features.Review.PlanOverlay", PlanOverlay)
 
 ]=]
 
@@ -7986,7 +8239,7 @@ return Tracer.instrument("Features.Supply.SupplyModel", SupplyModel)
 
 ]=]
 
-MODULE_SOURCES["Game/Arrows"] = [[
+MODULE_SOURCES["Game/Arrows"] = [=[
 local Arrows = {}
 local Tracer = require("Utility/Tracer")
 local MapGraph = require("Game/MapGraph")
@@ -8026,9 +8279,9 @@ function Arrows.endTime(arrowName, fromName, toName)
 end
 
 return Tracer.instrument("Game.Arrows", Arrows)
-]]
+]=]
 
-MODULE_SOURCES["Game/CountryState"] = [[
+MODULE_SOURCES["Game/CountryState"] = [=[
 local CountryState = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -8179,9 +8432,9 @@ function CountryState.folderNumber(country, folderName, attributeName)
 end
 
 return Tracer.instrument("Game.CountryState", CountryState)
-]]
+]=]
 
-MODULE_SOURCES["Game/Fleets"] = [[
+MODULE_SOURCES["Game/Fleets"] = [=[
 local Fleets = {}
 local Tracer = require("Utility/Tracer")
 local Resolver = require("Utility/Resolver")
@@ -8238,9 +8491,9 @@ function Fleets.scan()
 end
 
 return Tracer.instrument("Game.Fleets", Fleets)
-]]
+]=]
 
-MODULE_SOURCES["Game/GameModules"] = [[
+MODULE_SOURCES["Game/GameModules"] = [=[
 local GameModules = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -8304,9 +8557,9 @@ function GameModules.get(moduleName)
 end
 
 return GameModules
-]]
+]=]
 
-MODULE_SOURCES["Game/MapGraph"] = [[
+MODULE_SOURCES["Game/MapGraph"] = [=[
 local MapGraph = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -8469,9 +8722,9 @@ function MapGraph.edgeRiver(fromName, toName)
 end
 
 return MapGraph
-]]
+]=]
 
-MODULE_SOURCES["Game/Ownership"] = [[
+MODULE_SOURCES["Game/Ownership"] = [=[
 local Ownership = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -8714,9 +8967,9 @@ function Ownership.troopOwner(model)
 end
 
 return Ownership
-]]
+]=]
 
-MODULE_SOURCES["Game/Remotes"] = [[
+MODULE_SOURCES["Game/Remotes"] = [=[
 local Remotes = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -8793,9 +9046,9 @@ function Remotes.replySignal(remoteName)
 end
 
 return Tracer.instrument("Game.Remotes", Remotes)
-]]
+]=]
 
-MODULE_SOURCES["Game/Session"] = [[
+MODULE_SOURCES["Game/Session"] = [=[
 local Session = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -8899,9 +9152,9 @@ function Session.attach(maid)
 end
 
 return Tracer.instrument("Game.Session", Session)
-]]
+]=]
 
-MODULE_SOURCES["Game/Tick"] = [[
+MODULE_SOURCES["Game/Tick"] = [=[
 local Tick = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -9009,9 +9262,9 @@ function Tick.reset(reason)
 end
 
 return Tracer.instrument("Game.Tick", Tick)
-]]
+]=]
 
-MODULE_SOURCES["Game/Units"] = [[
+MODULE_SOURCES["Game/Units"] = [=[
 local Units = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -9028,7 +9281,6 @@ local LEVEL_PATTERN = "%d+"
 
 Units.mapModel = nil
 Units.records = {}
-Units.recordById = {}
 Units.recordByModel = {}
 Units.tileRecords = {}
 Units.nextId = 0
@@ -9120,7 +9372,6 @@ local function track(model, maid, origin)
 		superseded = false, addedServerTime = workspace:GetServerTimeNow(),
 	}
 	Units.records[record] = true
-	Units.recordById[unitId] = record
 	Units.recordByModel[model] = record
 	table.insert(tileList(tileName), record)
 	local connections = {}
@@ -9142,7 +9393,6 @@ local function track(model, maid, origin)
 		for _, connection in ipairs(connections) do connection:Disconnect() end
 		detachFromTile(record)
 		Units.records[record] = nil
-		Units.recordById[record.id] = nil
 		Units.recordByModel[model] = nil
 		local reason = parent == nil and "destroyed" or ("left the map for " .. parent:GetFullName())
 		if not record.superseded then Units.flagRecords[record.id] = nil end
@@ -9159,7 +9409,6 @@ function Units.reset(reason)
 	local tracked = 0
 	for _ in pairs(Units.records) do tracked += 1 end
 	table.clear(Units.records)
-	table.clear(Units.recordById)
 	table.clear(Units.recordByModel)
 	table.clear(Units.tileRecords)
 	table.clear(Units.flagRecords)
@@ -9245,38 +9494,34 @@ end
 
 function Units.snapshotNow(record)
 	local model = record.model
-	local state = model:GetAttribute("state") or "Idle"
-	local health = model:GetAttribute("health") or 100
-	local attack = model:GetAttribute("attack") or 5
-	local defense = model:GetAttribute("defense") or 5
-	local speed = model:GetAttribute("speed") or 1
-
 	return {
 		id = record.id, tile = record.tile, owner = record.owner,
 		troopName = record.troopName, class = record.class, level = record.level, model = model,
-		state = tostring(state),
-		health = tonumber(health) or 100,
-		attack = tonumber(attack) or 5,
-		defense = tonumber(defense) or 5,
-		speed = tonumber(speed) or 1,
-		experience = Resolver.optionalAttribute(model, "experience", "number", "fresh") or 0,
-		targetTile = Resolver.optionalAttribute(model, "targetTile", "string", "moving"),
-		currentPath = Resolver.optionalAttribute(model, "currentPath", "string", "path"),
-		attackerCount = Resolver.optionalAttribute(model, "attackerCount", "number", "defending"),
-		noSupply = model:GetAttribute("noSupply") == true,
-		noMoney = model:GetAttribute("noMoney") == true,
-		liveFlag = model:GetAttribute("dieOnNextRetreat") == true,
+		state = Resolver.requireAttribute(model, "state", "string"),
+		health = Resolver.requireAttribute(model, "health", "number"),
+		attack = Resolver.requireAttribute(model, "attack", "number"),
+		defense = Resolver.requireAttribute(model, "defense", "number"),
+		speed = Resolver.requireAttribute(model, "speed", "number"),
+		experience = Resolver.optionalAttribute(model, "experience", "number", "absent on a fresh Model before its first attack") or 0,
+		targetTile = Resolver.optionalAttribute(model, "targetTile", "string", "set only while moving, waiting, attacking or retreating"),
+		currentPath = Resolver.optionalAttribute(model, "currentPath", "string", "set only while an order has tiles left"),
+		attackerCount = Resolver.optionalAttribute(model, "attackerCount", "number", "set only once the unit has been attacked"),
+		noSupply = Resolver.optionalAttribute(model, "noSupply", "boolean", "written from the first supply pass on") == true,
+		noMoney = Resolver.optionalAttribute(model, "noMoney", "boolean", "written from the first upkeep pass on") == true,
+		liveFlag = Resolver.optionalAttribute(model, "dieOnNextRetreat", "boolean", "written from the first retreat on") == true,
 		flagged = Units.flaggedNow(record),
-		replenishConsumption = Resolver.optionalAttribute(model, "replenishConsumption", "number", "default 1"),
-		replenishSuppliesName = Resolver.optionalAttribute(model, "replenishSuppliesName", "string", "supplies"),
-		army = Resolver.optionalAttribute(model, "army", "string", "army"),
+		replenishConsumption = Resolver.optionalAttribute(model, "replenishConsumption", "number", "TroopCommon reads it with a default of 1"),
+		replenishSuppliesName = Resolver.optionalAttribute(model, "replenishSuppliesName", "string", "set by the server with the base stats"),
+		army = Resolver.optionalAttribute(model, "army", "string", "set only for members of an army group"),
 	}
 end
 
-
 return Units
-]]
+]=]
 
+-- ===============================================================================================
+-- [PORT-1] GUI/Rayfield — pengganti GUI/Linoria
+-- ===============================================================================================
 MODULE_SOURCES["GUI/Rayfield"] = [=[
 --[[
 	GUI/Rayfield
@@ -9324,6 +9569,9 @@ end
 return Tracer.instrument("GUI.Rayfield", Rayfield)
 ]=]
 
+-- ===============================================================================================
+-- [PORT-2] Menu — ditulis ulang untuk Rayfield Gen2
+-- ===============================================================================================
 MODULE_SOURCES["Menu"] = [=[
 --[[
 	Menu — Rayfield Gen2 (sesuai dokumentasi resmi).
@@ -9354,6 +9602,7 @@ local SLIDER_STEP_BASE = 10
 local HIDDEN_TABS = { Debug = true }
 local FORCE_OFF_KEYS = { ["ai.enabled"] = true, ["ai.sendOrders"] = true }
 
+local runService = game:GetService("RunService")
 
 Menu.rayfield = nil
 Menu.window = nil
@@ -9572,6 +9821,7 @@ function Menu.startPump()
 				Logger.error("Menu", "statusPumpFailed", { message = tostring(failure) })
 				return failure
 			end)
+			if not ok then break end
 		end
 	end)
 end
@@ -9659,7 +9909,95 @@ end
 return Tracer.instrument("Menu", Menu)
 ]=]
 
-MODULE_SOURCES["Utility/Formula"] = [[
+MODULE_SOURCES["Utility/FileSink"] = [=[
+local FileSink = {}
+FileSink.__index = FileSink
+local Serializer = require("Utility/Serializer")
+
+function FileSink.new(filePath)
+	writefile(filePath, "")
+	if not isfile(filePath) then
+		return error(string.format("FileSink.new: file '%s' could not be created", filePath))
+	end
+	local self = setmetatable({}, FileSink)
+	self.filePath = filePath
+	self.buffer = {}
+	self.recordsWritten = 0
+	self.bytesWritten = 0
+	self.flushCount = 0
+	return self
+end
+
+function FileSink:push(record)
+	table.insert(self.buffer, Serializer.encode(record))
+end
+
+function FileSink:flush()
+	if #self.buffer == 0 then return end
+	local chunk = table.concat(self.buffer, "\n") .. "\n"
+	appendfile(self.filePath, chunk)
+	self.recordsWritten += #self.buffer
+	self.bytesWritten += #chunk
+	self.flushCount += 1
+	table.clear(self.buffer)
+end
+
+function FileSink:stats()
+	return {
+		filePath = self.filePath, recordsWritten = self.recordsWritten,
+		bytesWritten = self.bytesWritten, flushCount = self.flushCount,
+		buffered = #self.buffer,
+	}
+end
+
+return FileSink
+]=]
+
+MODULE_SOURCES["Utility/FileSink"] = [=[
+local FileSink = {}
+FileSink.__index = FileSink
+local Serializer = require("Utility/Serializer")
+
+function FileSink.new(filePath)
+	writefile(filePath, "")
+	if not isfile(filePath) then
+		return error(string.format("FileSink.new: file '%s' could not be created", filePath))
+	end
+	local self = setmetatable({}, FileSink)
+	self.filePath = filePath
+	self.buffer = {}
+	self.recordsWritten = 0
+	self.bytesWritten = 0
+	self.flushCount = 0
+	return self
+end
+
+function FileSink:push(record)
+	table.insert(self.buffer, Serializer.encode(record))
+end
+
+function FileSink:flush()
+	if #self.buffer == 0 then return end
+	local chunk = table.concat(self.buffer, "\n") .. "\n"
+	appendfile(self.filePath, chunk)
+	self.recordsWritten += #self.buffer
+	self.bytesWritten += #chunk
+	self.flushCount += 1
+	table.clear(self.buffer)
+end
+
+function FileSink:stats()
+	return {
+		filePath = self.filePath, recordsWritten = self.recordsWritten,
+		bytesWritten = self.bytesWritten, flushCount = self.flushCount,
+		buffered = #self.buffer,
+	}
+end
+
+return FileSink
+]=]
+
+MODULE_SOURCES["Utility/Formula"] = [=[
 local Formula = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -9810,9 +10148,8 @@ function Formula.evaluate(id, inputs)
 	return value
 end
 
-
 return Formula
-]]
+]=]
 
 MODULE_SOURCES["Utility/Logger"] = [=[
 --[[
@@ -9835,7 +10172,7 @@ MODULE_SOURCES["Utility/Logger"] = [=[
 local Logger = {}
 
 Logger.LEVELS = { "TRACE", "DEBUG", "INFO", "WARN", "ERROR" }
-Logger.activeLevel = "WARN"
+Logger.activeLevel = "INFO"           -- [DEBUG] sementara untuk analisis
 Logger.counts = nil
 Logger.lastByLevel = {}
 Logger.sinks = {}
@@ -9852,7 +10189,7 @@ Logger.activeRank = LEVEL_RANK[Logger.activeLevel] or INFO_LVL
 Logger.filePath = "CTW_WarAI_log.txt"
 Logger.maxBuffer = 500
 Logger.flushInterval = 5.0
-Logger.dedupInterval = 5
+Logger.dedupInterval = 0              -- [DEBUG] matikan dedup
 Logger.buffer = {}
 Logger.bufferSize = 0
 Logger.lastFlush = 0
@@ -9993,7 +10330,7 @@ end
 return Logger
 ]=]
 
-MODULE_SOURCES["Utility/Maid"] = [[
+MODULE_SOURCES["Utility/Maid"] = [=[
 local Maid = {}
 Maid.__index = Maid
 local Logger = require("Utility/Logger")
@@ -10057,9 +10394,9 @@ end
 function Maid:count() return #self.tasks end
 
 return Maid
-]]
+]=]
 
-MODULE_SOURCES["Utility/Profiler"] = [[
+MODULE_SOURCES["Utility/Profiler"] = [=[
 local Profiler = {}
 local Logger = require("Utility/Logger")
 
@@ -10100,9 +10437,9 @@ function Profiler.snapshot()
 end
 
 return Profiler
-]]
+]=]
 
-MODULE_SOURCES["Utility/Resolver"] = [[
+MODULE_SOURCES["Utility/Resolver"] = [=[
 local Resolver = {}
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
@@ -10216,9 +10553,9 @@ function Resolver.optionalAttribute(instance, attributeName, expectedType, absen
 end
 
 return Resolver
-]]
+]=]
 
-MODULE_SOURCES["Utility/Serializer"] = [[
+MODULE_SOURCES["Utility/Serializer"] = [=[
 local Serializer = {}
 local httpService = game:GetService("HttpService")
 
@@ -10295,9 +10632,362 @@ function Serializer.decode(text, sourceName)
 end
 
 return Serializer
-]]
+]=]
 
-MODULE_SOURCES["Utility/Signal"] = [[
+MODULE_SOURCES["Utility/IntelManager"] = [=[
+local IntelManager = {}
+IntelManager.__index = IntelManager
+
+function IntelManager.new()
+	local self = setmetatable({}, IntelManager)
+	self.sightings = {}
+	self.threatMap = {}
+	self.forceEstimate = {}
+	self.pattern = { aggressiveness = 0.5, buildPhase = false, lastUnitCount = 0, unitGrowthRate = 0 }
+	self.fogMemory = {}
+	self.SIGHTING_EXPIRY = 45
+	self.SIGHTING_LONG_EXPIRY = 180
+	self.REGION_SIZE = 6
+	self.THREAT_DECAY = 0.92
+	self.MIN_THREAT = 0.01
+	self.lastScanTime = 0
+	self.SCAN_INTERVAL = 1.0
+	self.lastPatternUpdate = 0
+	self.PATTERN_INTERVAL = 5.0
+	return self
+end
+
+function IntelManager:regionKey(tx, tz)
+	return math.floor(tx / self.REGION_SIZE) .. "," .. math.floor(tz / self.REGION_SIZE)
+end
+
+function IntelManager:regionCenter(key)
+	local rx, rz = key:match("(-?%d+),(-?%d+)")
+	rx, rz = tonumber(rx), tonumber(rz)
+	return rx * self.REGION_SIZE + 3, rz * self.REGION_SIZE + 3
+end
+
+function IntelManager:unitThreatValue(typeId)
+	local tv = {
+		[1] = 1.0, [2] = 1.5, [3] = 3.0, [4] = 2.0,
+		[5] = 0.8, [6] = 1.2, [7] = 4.0, [8] = 2.5, [9] = 1.8,
+	}
+	return tv[typeId] or 1.0
+end
+
+function IntelManager:isInOurVision(tx, tz)
+	if not warState or not warState.ourUnits then return false end
+	local VR = 18
+	for _, u in pairs(warState.ourUnits) do
+		if u and u.Health > 0 then
+			local ux, uz = getUnitTile(u)
+			if distance(ux, uz, tx, tz) <= VR then return true end
+		end
+	end
+	return false
+end
+
+function IntelManager:getVisibleEnemies()
+	local list = {}
+	if not warState or not warState.units then return list end
+	for uid, u in pairs(warState.units) do
+		if u.NationId ~= ourNationId and u.Health > 0 then
+			local tx, tz = getUnitTile(u)
+			if self:isInOurVision(tx, tz) then
+				table.insert(list, {
+					unitId = uid, tileX = tx, tileZ = tz,
+					typeId = u.TypeId, hp = u.Health,
+					maxHp = u.MaxHealth, nationId = u.NationId,
+				})
+			end
+		end
+	end
+	return list
+end
+
+function IntelManager:scan()
+	local now = tick()
+	if now - self.lastScanTime < self.SCAN_INTERVAL then return end
+	self.lastScanTime = now
+
+	for _, e in ipairs(self:getVisibleEnemies()) do
+		local old = self.sightings[e.unitId]
+		if old then
+			old.lastSeen = now
+			old.tileX = e.tileX
+			old.tileZ = e.tileZ
+			old.hp = e.hp
+			old.isStale = false
+		else
+			self.sightings[e.unitId] = {
+				firstSeen = now, lastSeen = now,
+				tileX = e.tileX, tileZ = e.tileZ,
+				typeId = e.typeId, hp = e.hp, maxHp = e.maxHp,
+				isStale = false, staleness = 0,
+			}
+		end
+	end
+
+	for uid, s in pairs(self.sightings) do
+		local age = now - s.lastSeen
+		if age > self.SIGHTING_LONG_EXPIRY then
+			self.sightings[uid] = nil
+		else
+			s.isStale = age > self.SIGHTING_EXPIRY
+			s.staleness = math.min(age / self.SIGHTING_EXPIRY, 1.0)
+		end
+	end
+
+	self:rebuildThreatMap()
+	self:estimateForces()
+	self:updatePattern()
+end
+
+function IntelManager:rebuildThreatMap()
+	local now = tick()
+
+	for k, r in pairs(self.threatMap) do
+		r.score = r.score * self.THREAT_DECAY
+		r.enemyCount = r.enemyCount * self.THREAT_DECAY
+		if r.score < self.MIN_THREAT then self.threatMap[k] = nil end
+	end
+
+	for uid, s in pairs(self.sightings) do
+		local k = self:regionKey(s.tileX, s.tileZ)
+		if not self.threatMap[k] then
+			self.threatMap[k] = {score = 0, enemyCount = 0, friendlyCount = 0, lastUpdate = now}
+		end
+		local r = self.threatMap[k]
+		local w = s.isStale and (1.0 - s.staleness * 0.7) or 1.0
+		r.score = r.score + self:unitThreatValue(s.typeId) * w
+		r.enemyCount = r.enemyCount + w
+		r.lastUpdate = now
+	end
+
+	if warState and warState.ourUnits then
+		for _, u in pairs(warState.ourUnits) do
+			if u and u.Health > 0 then
+				local ux, uz = getUnitTile(u)
+				local k = self:regionKey(ux, uz)
+				if not self.threatMap[k] then
+					self.threatMap[k] = {score = 0, enemyCount = 0, friendlyCount = 0, lastUpdate = now}
+				end
+				self.threatMap[k].friendlyCount = self.threatMap[k].friendlyCount + 1
+			end
+		end
+	end
+end
+
+function IntelManager:estimateForces()
+	local counts = {}
+	for uid, s in pairs(self.sightings) do
+		if not s.isStale then
+			counts[s.typeId] = (counts[s.typeId] or 0) + 1
+		end
+	end
+
+	for tid, count in pairs(counts) do
+		if not self.forceEstimate[tid] then
+			self.forceEstimate[tid] = {estimated = count, peak = count, trend = 0}
+		end
+		local e = self.forceEstimate[tid]
+		e.peak = math.max(e.peak, count)
+		e.estimated = math.max(count, math.floor(e.peak * 1.5))
+	end
+
+	local total = 0
+	for _, c in pairs(counts) do total = total + c end
+
+	local prev = self.pattern.lastUnitCount
+	self.pattern.lastUnitCount = total
+	self.pattern.unitGrowthRate = prev > 0 and ((total - prev) / self.SCAN_INTERVAL) or 0
+	self.pattern.buildPhase = self.pattern.unitGrowthRate > 0.5
+
+	return total
+end
+
+function IntelManager:updatePattern()
+	local now = tick()
+	if now - self.lastPatternUpdate < self.PATTERN_INTERVAL then return end
+	self.lastPatternUpdate = now
+
+	local offensive, total = 0, 0
+	for uid, s in pairs(self.sightings) do
+		if not s.isStale then
+			total = total + 1
+			if self:isNearOurTerritory(s.tileX, s.tileZ) then
+				offensive = offensive + 1
+			end
+		end
+	end
+
+	if total > 0 then
+		local ratio = offensive / total
+		local growth = math.clamp(self.pattern.unitGrowthRate * 0.5, 0, 1)
+		self.pattern.aggressiveness = math.clamp(
+			ratio * 0.6 + growth * 0.2 + self.pattern.aggressiveness * 0.2, 0, 1
+		)
+	end
+end
+
+function IntelManager:isNearOurTerritory(tx, tz)
+	if not warState or not warState.ourUnits then return false end
+	for _, u in pairs(warState.ourUnits) do
+		if u and u.Health > 0 then
+			local ux, uz = getUnitTile(u)
+			if distance(ux, uz, tx, tz) <= 15 then return true end
+		end
+	end
+	return false
+end
+
+function IntelManager:getEffectiveThreat(key)
+	local r = self.threatMap[key]
+	if not r then return 0 end
+	return math.max(r.enemyCount * 3.0 - r.friendlyCount * 0.5, 0)
+end
+
+function IntelManager:getHighestThreatNear(tx, tz, maxR)
+	maxR = maxR or 30
+	local best, bestScore = nil, 0
+	for k, r in pairs(self.threatMap) do
+		local rx, rz = self:regionCenter(k)
+		local d = math.max(distance(rx, rz, tx, tz), 1)
+		if d <= maxR then
+			local ws = r.score / d
+			if ws > bestScore then bestScore = ws best = k end
+		end
+	end
+	if best then
+		local rx, rz = self:regionCenter(best)
+		return rx, rz, self.threatMap[best]
+	end
+	return nil, nil, nil
+end
+
+function IntelManager:getState()
+	return {
+		aggressiveness = self.pattern.aggressiveness,
+		buildPhase = self.pattern.buildPhase,
+		visibleEnemies = self.pattern.lastUnitCount,
+	}
+end
+
+return IntelManager
+]=]
+
+MODULE_SOURCES["Utility/Humanizer"] = [=[
+local Humanizer = {}
+Humanizer.__index = Humanizer
+
+function Humanizer.new()
+	local self = setmetatable({}, Humanizer)
+	self.config = {
+		minDelay = 0,
+		maxDelay = 0,
+		burstMinActions = 3,
+		burstMaxActions = 7,
+		burstPauseMin = 0.3,
+		burstPauseMax = 1.8,
+		idleChancePerCycle = 0.02,
+		idleDurationMin = 2.0,
+		idleDurationMax = 8.0,
+		pathJitterChance = 0.15,
+		pathJitterMax = 2,
+		majorActionCooldown = 1.2,
+		maxUnitsPerCycle = 8,
+		unitSelectionVariance = 3,
+		decisionDelayMin = 0.15,
+		decisionDelayMax = 0.8,
+	}
+	self.burstCount = 0
+	self.burstTarget = 0
+	self.nextBurstPause = 0
+	self.idleUntil = 0
+	self.lastMajorAction = 0
+	self.cycleCount = 0
+	self.lastJitteredPositions = {}
+	self.unitSeeds = {}
+	return self
+end
+
+function Humanizer:rand(min, max)
+	return min + math.random() * (max - min)
+end
+
+function Humanizer:randInt(min, max)
+	return math.floor(min + math.random() * (max - min + 1))
+end
+
+function Humanizer:shouldPause()
+	return false
+end
+
+function Humanizer:preOrder()
+	self.burstCount = self.burstCount + 1
+	self.lastMajorAction = tick()
+	return 0
+end
+
+function Humanizer:executeOrder(orderFunc, ...)
+	if self:shouldPause() then
+		task.wait(self:rand(self.config.burstPauseMin, self.config.burstPauseMax))
+	end
+
+	local delay = self:preOrder()
+	if delay > 0 then task.wait(delay) end
+	return orderFunc(...)
+end
+
+function Humanizer:jitterPosition(unitId, targetX, targetZ)
+	if math.random() > self.config.pathJitterChance then
+		return targetX, targetZ
+	end
+
+	local jitter = self:randInt(1, self.config.pathJitterMax)
+	local offset_x = self:randInt(-jitter, jitter)
+	local offset_z = self:randInt(-jitter, jitter)
+	local jx = targetX + offset_x
+	local jz = targetZ + offset_z
+	self.lastJitteredPositions[unitId] = {x = jx, z = jz}
+	return jx, jz
+end
+
+function Humanizer:selectUnits(unitTable)
+	local all = {}
+	for k, v in pairs(unitTable) do
+		table.insert(all, {key = k, value = v})
+	end
+
+	local count = math.min(
+		#all,
+		self:randInt(
+			self.config.maxUnitsPerCycle - self.config.unitSelectionVariance,
+			self.config.maxUnitsPerCycle + self.config.unitSelectionVariance
+		)
+	)
+
+	for i = #all, 2, -1 do
+		local j = math.random(1, i)
+		all[i], all[j] = all[j], all[i]
+	end
+
+	local result = {}
+	for i = 1, count do
+		result[all[i].key] = all[i].value
+	end
+	return result
+end
+
+function Humanizer:beginCycle()
+	self.cycleCount = self.cycleCount + 1
+	self.lastJitteredPositions = {}
+end
+
+return Humanizer
+]=]
+
+MODULE_SOURCES["Utility/Signal"] = [=[
 local Signal = {}
 Signal.__index = Signal
 local Logger = require("Utility/Logger")
@@ -10347,9 +11037,9 @@ end
 function Signal:Destroy() table.clear(self.listeners) end
 
 return Signal
-]]
+]=]
 
-MODULE_SOURCES["Utility/Stats"] = [[
+MODULE_SOURCES["Utility/Stats"] = [=[
 local Stats = {}
 local Tracer = require("Utility/Tracer")
 
@@ -10373,7 +11063,7 @@ function Stats.max(samples)
 end
 
 return Tracer.instrument("Utility.Stats", Stats)
-]]
+]=]
 
 MODULE_SOURCES["Utility/Tracer"] = [=[
 --[[
@@ -10405,12 +11095,17 @@ function Tracer.instrument(_, moduleTable) return moduleTable end
 return Tracer
 ]=]
 
+-- ===============================================================================================
+-- [PORT-3] WarAI — hanya 2 baris berubah dari versi Linoria
+-- ===============================================================================================
 MODULE_SOURCES["WarAI"] = [=[
 --[[
 	WarAI — versi ringan + push status dari Scheduler hooks.
 ]]
 
 local WarAI = { attached = false }
+local IntelManager = require("Utility/IntelManager")
+local Humanizer = require("Utility/Humanizer")
 local Logger = require("Utility/Logger")
 local Tracer = require("Utility/Tracer")
 local Maid = require("Utility/Maid")
@@ -10439,7 +11134,10 @@ local Scorecard = require("Features/Review/Scorecard")
 local AntiIdle = require("Features/Core/AntiIdle")
 local Scheduler = require("Features/Core/Scheduler")
 
+local RAISE_SITE_STACK_LEVEL = 2
 local STATUS_KEYS = {}
+
+local runService = game:GetService("RunService")
 
 local maid = nil
 local worldMaid = nil
@@ -10474,6 +11172,8 @@ function WarAI.onCountryChanged(country, reason)
 		Scheduler.requestTick({ reason = "country changed" })
 	end
 end
+
+local Intel = { intel = IntelManager.new(), humanizer = Humanizer.new() }
 
 function WarAI.onTick(world, analysis, plan)
 	EconomyPlanner.run(world, analysis)
@@ -10588,7 +11288,6 @@ end
 
 return Tracer.instrument("WarAI", WarAI)
 ]=]
-
 
 -- ===============================================================================================
 -- EPILOGUE LOADER
